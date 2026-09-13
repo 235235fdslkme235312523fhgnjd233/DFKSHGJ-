@@ -1,4 +1,4 @@
--- LinoriaLib Optimized | Unnamed Enhancements
+- LinoriaLib Optimized | Unnamed Enhancements
 -- 최적화 포인트:
 --   1. Registry 업데이트를 dirty flag 방식으로 변경 (불필요한 루프 제거)
 --   2. 중복 Create 호출 통합
@@ -20,7 +20,10 @@ local LocalPlayer   = Players.LocalPlayer
 local Mouse         = LocalPlayer:GetMouse()
 
 -- ── GUI 보호 ──────────────────────────────────────────────────────────────
-local ProtectGui = protectgui or (syn and syn.protect_gui) or (function() end)
+local ProtectGui = (typeof(protectgui) == 'function' and protectgui)
+    or (type(syn) == 'table' and typeof(syn.protect_gui) == 'function' and syn.protect_gui)
+    or function() end
+
 local ScreenGui  = Instance.new('ScreenGui')
 ProtectGui(ScreenGui)
 ScreenGui.ZIndexBehavior = Enum.ZIndexBehavior.Global
@@ -29,8 +32,10 @@ ScreenGui.Parent = CoreGui
 -- ── 전역 테이블 ───────────────────────────────────────────────────────────
 local Toggles = {}
 local Options = {}
-getgenv().Toggles = Toggles
-getgenv().Options = Options
+
+local _genv = (typeof(getgenv) == 'function' and getgenv()) or _G
+_genv.Toggles = Toggles
+_genv.Options = Options
 
 -- ── 라이브러리 코어 ───────────────────────────────────────────────────────
 local Library = {
@@ -1678,8 +1683,31 @@ function Library:CreateWindow(...)
             Outer.Visible = true
             task.spawn(function()
                 local state = InputService.MouseIconEnabled
-                local Cur  = Drawing.new('Triangle'); Cur.Thickness=1; Cur.Filled=true; Cur.Visible=true
-                local CurO = Drawing.new('Triangle'); CurO.Thickness=1; CurO.Filled=false; CurO.Color=Color3.new(0,0,0); CurO.Visible=true
+
+                -- Drawing 미지원 환경 안전 처리
+                if not (typeof(Drawing) == 'table' or typeof(Drawing) == 'userdata') then
+                    while Toggled and ScreenGui.Parent do
+                        InputService.MouseIconEnabled = false
+                        RenderStepped:Wait()
+                    end
+                    InputService.MouseIconEnabled = state
+                    return
+                end
+
+                local ok, Cur  = pcall(Drawing.new, 'Triangle')
+                local ok2, CurO = pcall(Drawing.new, 'Triangle')
+                if not ok or not ok2 then
+                    while Toggled and ScreenGui.Parent do
+                        InputService.MouseIconEnabled = false
+                        RenderStepped:Wait()
+                    end
+                    InputService.MouseIconEnabled = state
+                    return
+                end
+
+                Cur.Thickness=1; Cur.Filled=true; Cur.Visible=true
+                CurO.Thickness=1; CurO.Filled=false; CurO.Color=Color3.new(0,0,0); CurO.Visible=true
+
                 while Toggled and ScreenGui.Parent do
                     InputService.MouseIconEnabled = false
                     local mp = InputService:GetMouseLocation()
@@ -1738,5 +1766,5 @@ end
 Players.PlayerAdded:Connect(OnPlayerChange)
 Players.PlayerRemoving:Connect(OnPlayerChange)
 
-getgenv().Library = Library
+_genv.Library = Library
 return Library
