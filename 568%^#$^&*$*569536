@@ -1,7 +1,7 @@
 --[[
     KiciaHook UI Library
     Usage:
-        local UI = loadstring(game:HttpGet("https://your.link/here.lua"))()
+        local UI = loadstring(game:HttpGet("https://raw.githubusercontent.com/235235fdslkme235312523fhgnjd233/DFKSHGJ-/refs/heads/main/568%25%5E%23%24%5E%26*%24*569536"))()
         local base = UI.new():setLabel("My Script")
         local tabList = base:newTabList()
         local main = tabList:newTab("Main"):intoSections()
@@ -38,10 +38,10 @@ do
             if t == "RBXScriptConnection" then return "Disconnect" end
             if t == "table" then
                 for _, m in GENERIC do
-                    if typeof(object[m]) == "function" then return m end
+                    if type(object[m]) == "function" then return m end
                 end
             end
-            error(("failed to get cleanup function for object %s: %s"):format(t, object), 3)
+            error(("failed to get cleanup function for object %s: %s"):format(t, tostring(object)), 3)
         end
 
         local function assertPromise(p)
@@ -397,7 +397,7 @@ do
     end
 
     -- ============================================================
-    -- UIExtendable (base for tabs / sections)
+    -- UIExtendable
     -- ============================================================
     local UIExtendable = {}
     UIExtendable.__index = UIExtendable
@@ -1929,6 +1929,7 @@ do
         if self.visible == state then return end
         self.visible = state
         self.instances.container.Visible = state
+        self.instances.open.Visible = not state
         self.visibilityChanged:Fire(state)
     end
     function UIBase:makeDraggable(guiObject, trove, callback)
@@ -2150,7 +2151,7 @@ do
     function UISection:newButton(flag)                return UIButton.new(self, flag) end
 
     -- ============================================================
-    -- Public API — what loadstring returns
+    -- Public API
     -- ============================================================
     LIB.Trove  = Trove
     LIB.Signal = Signal
