@@ -1,5 +1,5 @@
 --!strict
--- Linoria Reforged v3 | White Theme | Pooled | AutoSave | Smooth
+-- Linoria Reforged v5 | White Theme | Pooled | AutoSave | Fixed
 -- He's build. No blue. No leaks. No lag. Save persists.
 
 local InputService = game:GetService('UserInputService')
@@ -17,23 +17,26 @@ local Heartbeat    = RunService.Heartbeat
 local LocalPlayer  = Players.LocalPlayer
 local Mouse        = LocalPlayer:GetMouse()
 
-local ProtectGui = protectgui or (syn and syn.protect_gui) or function() end
-local WriteFile  = writefile or (syn and syn.write_file) or function() end
-local ReadFile   = readfile or (syn and syn.read_file) or function() return nil end
-local IsFile     = isfile or (syn and syn.is_file) or function() return false end
-local DelFile    = delfile or (syn and syn.delete_file) or function() end
-local MakeFolder = makefolder or (syn and syn.make_folder) or function() end
-local IsFolder   = isfolder or (syn and syn.is_folder) or function() return false end
-local ListFiles  = listfiles or (syn and syn.list_files) or function() return {} end
+local ProtectGui  = protectgui or (syn and syn.protect_gui) or function() end
+local WriteFile   = writefile or (syn and syn.write_file) or function() end
+local ReadFile    = readfile or (syn and syn.read_file) or function() return nil end
+local IsFile      = isfile or (syn and syn.is_file) or function() return false end
+local DelFile     = delfile or (syn and syn.delete_file) or function() end
+local MakeFolder  = makefolder or (syn and syn.make_folder) or function() end
+local IsFolder    = isfolder or (syn and syn.is_folder) or function() return false end
+local ListFilesFn = listfiles or (syn and syn.list_files) or function() return {} end
 
-local FOLDER_NAME = 'LinoriaReforged'
-if not IsFolder(FOLDER_NAME) then pcall(MakeFolder, FOLDER_NAME) end
-local CONFIG_DIR   = FOLDER_NAME .. '/configs'
-local THEME_DIR    = FOLDER_NAME .. '/themes'
-local AUTOLOAD_FILE = FOLDER_NAME .. '/autoload.txt'
+local FOLDER_NAME     = 'LinoriaReforged'
+local CONFIG_DIR      = FOLDER_NAME .. '/configs'
+local THEME_DIR       = FOLDER_NAME .. '/themes'
+local AUTOLOAD_FILE   = FOLDER_NAME .. '/autoload.txt'
 local LASTCONFIG_FILE = FOLDER_NAME .. '/last.txt'
-if not IsFolder(CONFIG_DIR) then pcall(MakeFolder, CONFIG_DIR) end
-if not IsFolder(THEME_DIR)  then pcall(MakeFolder, THEME_DIR)  end
+
+pcall(function()
+    if not IsFolder(FOLDER_NAME) then MakeFolder(FOLDER_NAME) end
+    if not IsFolder(CONFIG_DIR) then MakeFolder(CONFIG_DIR) end
+    if not IsFolder(THEME_DIR) then MakeFolder(THEME_DIR) end
+end)
 
 -- ─────────────────────────────────────────────
 --  Boot GUI
@@ -58,9 +61,7 @@ local Library = {
     Registry        = setmetatable({}, {__mode = 'v'}),
     RegistryMap     = setmetatable({}, {__mode = 'k'}),
     HudRegistry     = {},
-    DirtyColors     = true,
 
-    -- WHITE THEME — NO BLUE ANYWHERE
     FontColor       = Color3.fromRGB(240, 240, 240),
     MainColor       = Color3.fromRGB(28, 28, 28),
     BackgroundColor = Color3.fromRGB(20, 20, 20),
@@ -87,13 +88,11 @@ local Library = {
     TooltipRate    = 60,
     NotifyDuration = 5,
 
-    -- auto-save / auto-load
     AutoSaveEnabled  = true,
     AutoSaveDebounce = 0.5,
     AutoSaveName     = 'autosave',
     _autoSaveDirty   = false,
     _autoSaveThread  = nil,
-    _lastLoadName    = 'none',
 
     NotifyConfig = {
         Alignment = 'Left',
@@ -107,9 +106,6 @@ local Library = {
     _textCacheMax   = 2048,
     _tweenPool      = {},
     _tweenPoolMax   = 128,
-    _notifyPool     = {},
-    _notifyPoolMax  = 6,
-    _colorWatchers  = {},
     _currentTheme   = 'Default',
 }
 
@@ -126,6 +122,7 @@ Library.BlurEffect.Enabled = false
 pcall(function() Library.BlurEffect.Parent = Lighting end)
 
 function Library:UpdateBlur()
+    if not Library.BlurEffect then return end
     if Library.UseBlur and Library.Toggled then
         Library.BlurEffect.Enabled = true
         Library:_Tween(Library.BlurEffect, TweenInfo.new(0.22, Enum.EasingStyle.Quad), {Size = Library.BlurSize})
@@ -161,16 +158,18 @@ function Library:_Tween(instance, info, props)
     return tween
 end
 
--- Smooth color fade helper for Theme transitions
 function Library:_TweenColor(instance, prop, target, dur)
     local start = instance[prop]
     if typeof(start) ~= 'Color3' then instance[prop] = target return end
-    local t0 = os.clock()
-    local dur = dur or 0.18
+    dur = dur or 0.18
     task.spawn(function()
+        local t0 = os.clock()
         while true do
             local a = (os.clock() - t0) / dur
-            if a >= 1 then instance[prop] = target break end
+            if a >= 1 or not instance.Parent then
+                if instance.Parent then instance[prop] = target end
+                break
+            end
             instance[prop] = Color3.new(
                 start.R + (target.R - start.R) * a,
                 start.G + (target.G - start.G) * a,
@@ -185,10 +184,10 @@ end
 --  Text bounds LRU
 -- ─────────────────────────────────────────────
 function Library:GetTextBounds(text, font, size, res)
-    local key = text .. '\0' .. tostring(font) .. '\0' .. tostring(size)
+    local key = tostring(text) .. '\0' .. tostring(font) .. '\0' .. tostring(size)
     local cached = Library._textCache[key]
     if cached then return cached[1], cached[2] end
-    local b = TextService:GetTextSize(text, size, font, res or Vector2.new(1920, 1080))
+    local b = TextService:GetTextSize(tostring(text), size, font, res or Vector2.new(1920, 1080))
     Library._textCache[key] = {b.X, b.Y}
     table.insert(Library._textCacheOrder, key)
     if #Library._textCacheOrder > Library._textCacheMax then
@@ -239,7 +238,7 @@ function Library:AttemptSave()
 end
 
 -- ─────────────────────────────────────────────
---  AutoSave / AutoLoad engine
+--  AutoSave engine
 -- ─────────────────────────────────────────────
 function Library:MarkAutoSaveDirty()
     if not Library.AutoSaveEnabled then return end
@@ -259,9 +258,6 @@ function Library:SetAutoSave(enabled)
     Library.AutoSaveEnabled = not not enabled
     if Library.AutoSaveEnabled then
         Library:MarkAutoSaveDirty()
-        Library:Notify('AutoSave: ON', 2.5)
-    else
-        Library:Notify('AutoSave: OFF', 2.5)
     end
 end
 
@@ -276,10 +272,6 @@ function Library:Create(class, props)
     local inst = class
     if type(class) == 'string' then inst = Instance.new(class) end
     for k, v in next, props do inst[k] = v end
-    if inst:IsA('TextLabel') or inst:IsA('TextBox') or inst:IsA('TextButton') then
-        local offset = props.TextSize and (props.TextSize - Library.FontSize) or 0
-        inst:SetAttribute('FontSizeOffset', offset)
-    end
     return inst
 end
 
@@ -325,17 +317,15 @@ function Library:RemoveFromRegistry(instance)
     Library.RegistryMap[instance] = nil
 end
 
--- Dirty-flag driven color update — skips untouched frames
 function Library:UpdateColorsUsingRegistry()
     Library.AccentColorDark = Library:GetDarkerColor(Library.AccentColor)
-    Library.DirtyColors = false
     for _, obj in next, Library.Registry do
         local inst = obj.Instance
         if inst.Parent then
             for prop, colorKey in next, obj.Properties do
                 if type(colorKey) == 'string' then
                     local c = Library[colorKey]
-                    if c and inst[prop] ~= c then
+                    if c and typeof(c) == 'Color3' and inst[prop] ~= c then
                         inst[prop] = c
                     end
                 end
@@ -589,7 +579,7 @@ do
     Library:GiveSignal(Heartbeat:Connect(function(dt)
         if not Library._tooltipActive then return end
         acc = acc + dt
-        local step = 1 / Library.TooltipRate
+        local step = 1 / (Library.TooltipRate or 60)
         if acc < step then return end
         acc = 0
         tooltip.Position = UDim2.fromOffset(Mouse.X + 15, Mouse.Y + 12)
@@ -619,21 +609,23 @@ function Library:OnHighlight(hoverInstance, targetInstance, hoverProps, defaultP
     Library:GiveSignal(hoverInstance.MouseEnter:Connect(function()
         local reg = Library.RegistryMap[targetInstance]
         for prop, colorKey in next, hoverProps do
-            targetInstance[prop] = Library[colorKey] or colorKey
+            local v = Library[colorKey] or colorKey
+            targetInstance[prop] = v
             if reg and reg.Properties[prop] then reg.Properties[prop] = colorKey end
         end
     end))
     Library:GiveSignal(hoverInstance.MouseLeave:Connect(function()
         local reg = Library.RegistryMap[targetInstance]
         for prop, colorKey in next, defaultProps do
-            targetInstance[prop] = Library[colorKey] or colorKey
+            local v = Library[colorKey] or colorKey
+            targetInstance[prop] = v
             if reg and reg.Properties[prop] then reg.Properties[prop] = colorKey end
         end
     end))
 end
 
 -- ─────────────────────────────────────────────
---  Theme capture / apply
+--  Theme
 -- ─────────────────────────────────────────────
 local ThemeKeys = {
     'FontColor', 'MainColor', 'BackgroundColor', 'AccentColor',
@@ -648,15 +640,12 @@ function Library:CaptureTheme()
     return t
 end
 
-function Library:ApplyTheme(t, smooth)
+function Library:ApplyTheme(t)
     if type(t) ~= 'table' then return end
     for _, k in ipairs(ThemeKeys) do
         if type(t[k]) == 'string' then
             local ok, c = pcall(Color3.fromHex, t[k])
             if ok and typeof(c) == 'Color3' then
-                if smooth then
-                    -- apply instantly for registry hits, avoid per-element tween spam
-                end
                 Library[k] = c
             end
         end
@@ -675,8 +664,8 @@ function Library:LoadTheme(name)
     if not IsFile(path) then return false end
     local ok, raw = pcall(ReadFile, path)
     if not ok or not raw then return false end
-    local ok2, decoded = pcall(HttpService.JSONDecode, HttpService, raw)
-    if not ok2 then return false end
+    local ok2, decoded = pcall(function() return HttpService:JSONDecode(raw) end)
+    if not ok2 or type(decoded) ~= 'table' then return false end
     Library:ApplyTheme(decoded)
     Library._currentTheme = name
     return true
@@ -684,11 +673,13 @@ end
 
 function Library:ListThemes()
     local out = {'Default'}
-    local ok, files = pcall(ListFiles, THEME_DIR)
-    if ok and files then
+    local ok, files = pcall(ListFilesFn, THEME_DIR)
+    if ok and type(files) == 'table' then
         for _, f in ipairs(files) do
-            local name = f:match('([^/\\]+)%.json$')
-            if name and name ~= 'autotheme' then table.insert(out, name) end
+            local name = tostring(f):match('([^/\\]+)%.json$')
+            if name and name ~= 'autotheme' and name ~= '__default' then
+                table.insert(out, name)
+            end
         end
     end
     return out
@@ -696,11 +687,13 @@ end
 
 function Library:ListConfigs()
     local out = {}
-    local ok, files = pcall(ListFiles, CONFIG_DIR)
-    if ok and files then
+    local ok, files = pcall(ListFilesFn, CONFIG_DIR)
+    if ok and type(files) == 'table' then
         for _, f in ipairs(files) do
-            local name = f:match('([^/\\]+)%.json$')
-            if name and name ~= 'autosave' then table.insert(out, name) end
+            local name = tostring(f):match('([^/\\]+)%.json$')
+            if name and name ~= 'autosave' and not name:match('%.bak$') then
+                table.insert(out, name)
+            end
         end
     end
     return out
@@ -741,7 +734,6 @@ function Library:SaveConfig(name, silent)
     end
     local data = Library:SerializeOptions()
     pcall(WriteFile, path, HttpService:JSONEncode(data))
-    Library._lastLoadName = name
     pcall(WriteFile, LASTCONFIG_FILE, name)
     if not silent then
         Library:Notify('Saved: ' .. name, 2.5)
@@ -753,7 +745,7 @@ function Library:LoadConfig(name, silent)
     if not IsFile(path) then return false end
     local ok, raw = pcall(ReadFile, path)
     if not ok or not raw then return false end
-    local ok2, data = pcall(HttpService.JSONDecode, HttpService, raw)
+    local ok2, data = pcall(function() return HttpService:JSONDecode(raw) end)
     if not ok2 or type(data) ~= 'table' then return false end
 
     if data.__theme then Library:ApplyTheme(data.__theme) end
@@ -779,7 +771,6 @@ function Library:LoadConfig(name, silent)
             end
         end
     end
-    Library._lastLoadName = name
     pcall(WriteFile, LASTCONFIG_FILE, name)
     if not silent then
         Library:Notify('Loaded: ' .. name, 2.5)
@@ -811,21 +802,17 @@ end
 
 function Library:RunAutoLoad()
     local name = Library:GetAutoLoadName()
-    if not name then
-        -- fall back to last-used config
-        if IsFile(LASTCONFIG_FILE) then
-            local ok, last = pcall(ReadFile, LASTCONFIG_FILE)
-            if ok and last and last ~= '' then name = last end
-        end
+    if not name and IsFile(LASTCONFIG_FILE) then
+        local ok, last = pcall(ReadFile, LASTCONFIG_FILE)
+        if ok and last and last ~= '' then name = last end
     end
     if name then
         Library:LoadConfig(name, true)
-        Library._lastLoadName = name
     end
 end
 
 -- ─────────────────────────────────────────────
---  Addons (ColorPicker, KeyPicker)
+--  Addons
 -- ─────────────────────────────────────────────
 local BaseAddons = {}
 do
@@ -1086,7 +1073,7 @@ do
             if enter then
                 local r, g, b = rgbBox.Text:match('(%d+),%s*(%d+),%s*(%d+)')
                 if r and g and b then
-                    picker.Hue, picker.Sat, picker.Vib = Color3.toHSV(Color3.fromRGB(r, g, b))
+                    picker.Hue, picker.Sat, picker.Vib = Color3.toHSV(Color3.fromRGB(tonumber(r), tonumber(g), tonumber(b)))
                 end
             end
             picker:Display()
@@ -1137,11 +1124,13 @@ do
             picker.Transparency = transparency or 0
             picker:SetHSVFromRGB(c)
             picker:Display()
+            Library:MarkAutoSaveDirty()
         end
         function picker:SetValueRGB(c, transparency)
             picker.Transparency = transparency or 0
             picker:SetHSVFromRGB(c)
             picker:Display()
+            Library:MarkAutoSaveDirty()
         end
         function picker:GetTransparency() return picker.Transparency end
         function picker:OnTransparencyChanged(f)
@@ -1149,7 +1138,6 @@ do
             f(picker.Transparency)
         end
 
-        -- sv drag
         Library:GiveSignal(svMap.InputBegan:Connect(function(input)
             if input.UserInputType ~= Enum.UserInputType.MouseButton1
                 and input.UserInputType ~= Enum.UserInputType.Touch then return end
@@ -1269,7 +1257,7 @@ do
         picker:Display()
         picker.DisplayFrame = display
         Options[idx] = picker
-        return self
+        return picker
     end
 
     function Funcs:AddColorPickerAlpha(idx, info)
@@ -1280,7 +1268,6 @@ do
 
     function Funcs:AddKeyPicker(idx, info)
         local parentObj = self
-        local toggleLabel = self.TextLabel
         assert(info.Default, 'AddKeyPicker: Missing default value.')
 
         local keyPicker = {
@@ -1291,16 +1278,97 @@ do
             Callback = info.Callback or function() end,
             ChangedCallback = info.ChangedCallback or function() end,
             SyncToggleState = info.SyncToggleState or false,
+            NoUI = info.NoUI or false,
         }
         if keyPicker.SyncToggleState then
             info.Modes = {'Toggle'}
             info.Mode = 'Toggle'
         end
 
+        function keyPicker:GetState()
+            if keyPicker.Mode == 'Always' then return true end
+            if keyPicker.Mode == 'Hold' then
+                if keyPicker.Value == 'None' then return false end
+                local key = keyPicker.Value
+                if key == 'MB1' then return InputService:IsMouseButtonPressed(Enum.UserInputType.MouseButton1) end
+                if key == 'MB2' then return InputService:IsMouseButtonPressed(Enum.UserInputType.MouseButton2) end
+                if key == 'Touch' then return true end
+                return InputService:IsKeyDown(Enum.KeyCode[key])
+            end
+            return keyPicker.Toggled
+        end
+
+        function keyPicker:DoClick()
+            if parentObj.Type == 'Toggle' and keyPicker.SyncToggleState then
+                parentObj:SetValue(not parentObj.Value)
+            end
+            Library:SafeCallback(keyPicker.Callback, keyPicker.Toggled)
+            Library:SafeCallback(keyPicker.Clicked, keyPicker.Toggled)
+        end
+
+        function keyPicker:Update() end
+        function keyPicker:SetValue(data)
+            keyPicker.Value = data[1]
+            keyPicker.Mode = data[2] or keyPicker.Mode
+        end
+        function keyPicker:OnClick(cb) keyPicker.Clicked = cb end
+        function keyPicker:OnChanged(cb)
+            keyPicker.Changed = cb
+            cb(keyPicker.Value)
+        end
+
+        -- NoUI: pure functional keypicker (no visible widgets)
+        if keyPicker.NoUI then
+            local pickOuter = Library:Create('Frame', {
+                BackgroundTransparency = 1,
+                Size = UDim2.new(0, 0, 0, 0),
+                Visible = false,
+                ZIndex = 1,
+                Parent = self.Container,
+            })
+
+            Library:GiveSignal(InputService.InputBegan:Connect(function(input)
+                if keyPicker.Mode == 'Toggle' then
+                    local key = keyPicker.Value
+                    local fire = false
+                    if key == 'MB1' and input.UserInputType == Enum.UserInputType.MouseButton1 then fire = true
+                    elseif key == 'MB2' and input.UserInputType == Enum.UserInputType.MouseButton2 then fire = true
+                    elseif key == 'Touch' and input.UserInputType == Enum.UserInputType.Touch then fire = true
+                    elseif input.UserInputType == Enum.UserInputType.Keyboard and input.KeyCode.Name == key then fire = true
+                    end
+                    if fire then
+                        keyPicker.Toggled = not keyPicker.Toggled
+                        keyPicker:DoClick()
+                    end
+                end
+            end))
+
+            if parentObj.Addons then
+                table.insert(parentObj.Addons, keyPicker)
+            end
+            Options[idx] = keyPicker
+            return keyPicker
+        end
+
+        -- ── Visible keypicker
+        local toggleLabel = self.TextLabel
+        if toggleLabel then
+            local layout = toggleLabel:FindFirstChildOfClass('UIListLayout')
+            if not layout then
+                layout = Library:Create('UIListLayout', {
+                    Padding = UDim.new(0, 4),
+                    FillDirection = Enum.FillDirection.Horizontal,
+                    HorizontalAlignment = Enum.HorizontalAlignment.Right,
+                    SortOrder = Enum.SortOrder.LayoutOrder,
+                    Parent = toggleLabel,
+                })
+            end
+        end
+
         local pickOuter = Library:Create('Frame', {
             BackgroundColor3 = Color3.new(0, 0, 0),
             BorderColor3 = Color3.new(0, 0, 0),
-            Size = UDim2.new(0, 28, 0, 15),
+            Size = UDim2.new(0, 32, 0, 15),
             ZIndex = 6,
             Parent = toggleLabel,
         })
@@ -1315,12 +1383,13 @@ do
         Library:AddToRegistry(pickInner, {BackgroundColor3 = 'BackgroundColor', BorderColor3 = 'OutlineColor'})
         local displayLabel = Library:CreateLabel({
             Size = UDim2.new(1, 0, 1, 0),
-            TextSize = Library.FontSize - 1,
+            TextSize = Library.FontSize - 2,
             Text = info.Default,
-            TextWrapped = true,
+            TextTruncate = Enum.TextTruncate.AtEnd,
             ZIndex = 8,
             Parent = pickInner,
         })
+
         local modeOuter = Library:Create('Frame', {
             BorderColor3 = Color3.new(0, 0, 0),
             Position = UDim2.fromOffset(toggleLabel.AbsolutePosition.X + toggleLabel.AbsoluteSize.X + 4, toggleLabel.AbsolutePosition.Y + 1),
@@ -1330,7 +1399,10 @@ do
             Parent = ScreenGui,
         })
         Library:GiveSignal(toggleLabel:GetPropertyChangedSignal('AbsolutePosition'):Connect(function()
-            modeOuter.Position = UDim2.fromOffset(toggleLabel.AbsolutePosition.X + toggleLabel.AbsoluteSize.X + 4, toggleLabel.AbsolutePosition.Y + 1)
+            modeOuter.Position = UDim2.fromOffset(
+                toggleLabel.AbsolutePosition.X + toggleLabel.AbsoluteSize.X + 4,
+                toggleLabel.AbsolutePosition.Y + 1
+            )
         end))
         local modeInner = Library:Create('Frame', {
             BackgroundColor3 = Library.BackgroundColor,
@@ -1346,6 +1418,7 @@ do
             SortOrder = Enum.SortOrder.LayoutOrder,
             Parent = modeInner,
         })
+
         local keybindEntry = Library:Create('Frame', {
             BackgroundTransparency = 1,
             Size = UDim2.new(1, 0, 0, 18),
@@ -1382,7 +1455,6 @@ do
                 modeOuter.Visible = false
             end
             function mb:Deselect()
-                keyPicker.Mode = nil
                 label.TextColor3 = Library.FontColor
                 Library.RegistryMap[label].Properties.TextColor3 = 'FontColor'
             end
@@ -1398,10 +1470,10 @@ do
         end
 
         function keyPicker:Update()
-            if info.NoUI then return end
             local state = keyPicker:GetState()
             local displayKey = (keyPicker.Value == 'None') and '...' or keyPicker.Value
             containerLabel.Text = string.format('[%s] %s (%s)', displayKey, info.Text, keyPicker.Mode)
+
             local kbMode = Library.KeybindMode or 'All'
             if kbMode == 'Active' then
                 keybindEntry.Visible = state == true
@@ -1415,7 +1487,9 @@ do
                 keybindEntry.Visible = true
             end
             containerLabel.TextColor3 = state and Library.AccentColor or Library.FontColor
-            Library.RegistryMap[containerLabel].Properties.TextColor3 = state and 'AccentColor' or 'FontColor'
+            if Library.RegistryMap[containerLabel] then
+                Library.RegistryMap[containerLabel].Properties.TextColor3 = state and 'AccentColor' or 'FontColor'
+            end
 
             local ySize, xSize = 0, 0
             for _, frame in next, Library.KeybindContainer:GetChildren() do
@@ -1430,44 +1504,18 @@ do
             Library.KeybindFrame.Size = UDim2.new(0, math.max(xSize + 25, 210), 0, ySize + 23)
         end
 
-        function keyPicker:GetState()
-            if keyPicker.Mode == 'Always' then return true end
-            if keyPicker.Mode == 'Hold' then
-                if keyPicker.Value == 'None' then return false end
-                local key = keyPicker.Value
-                if key == 'MB1' then return InputService:IsMouseButtonPressed(Enum.UserInputType.MouseButton1) end
-                if key == 'MB2' then return InputService:IsMouseButtonPressed(Enum.UserInputType.MouseButton2) end
-                if key == 'Touch' then return true end
-                return InputService:IsKeyDown(Enum.KeyCode[key])
-            end
-            return keyPicker.Toggled
-        end
-
         function keyPicker:SetValue(data)
             local key, mode = data[1], data[2]
             displayLabel.Text = key
             keyPicker.Value = key
             if mode and modeButtons[mode] then modeButtons[mode]:Select() end
             keyPicker:Update()
-        end
-
-        function keyPicker:OnClick(cb) keyPicker.Clicked = cb end
-        function keyPicker:OnChanged(cb)
-            keyPicker.Changed = cb
-            cb(keyPicker.Value)
+            Library:MarkAutoSaveDirty()
         end
 
         if parentObj.Addons then
             table.insert(parentObj.Addons, keyPicker)
             table.insert(Library.KeyPickerList, keyPicker)
-        end
-
-        function keyPicker:DoClick()
-            if parentObj.Type == 'Toggle' and keyPicker.SyncToggleState then
-                parentObj:SetValue(not parentObj.Value)
-            end
-            Library:SafeCallback(keyPicker.Callback, keyPicker.Toggled)
-            Library:SafeCallback(keyPicker.Clicked, keyPicker.Toggled)
         end
 
         local picking = false
@@ -1499,6 +1547,7 @@ do
                     elseif inp.UserInputType == Enum.UserInputType.Touch then
                         key = 'Touch'
                     end
+                    if not key then return end
                     stop = true
                     picking = false
                     displayLabel.Text = key
@@ -1518,23 +1567,13 @@ do
             if not picking then
                 if keyPicker.Mode == 'Toggle' then
                     local key = keyPicker.Value
-                    if key == 'MB1' then
-                        if input.UserInputType == Enum.UserInputType.MouseButton1 then
-                            keyPicker.Toggled = not keyPicker.Toggled
-                            keyPicker:DoClick()
-                        end
-                    elseif key == 'MB2' then
-                        if input.UserInputType == Enum.UserInputType.MouseButton2 then
-                            keyPicker.Toggled = not keyPicker.Toggled
-                            keyPicker:DoClick()
-                        end
-                    elseif key == 'Touch' then
-                        if input.UserInputType == Enum.UserInputType.Touch then
-                            keyPicker.Toggled = not keyPicker.Toggled
-                            keyPicker:DoClick()
-                        end
-                    elseif input.UserInputType == Enum.UserInputType.Keyboard
-                        and input.KeyCode.Name == key then
+                    local fire = false
+                    if key == 'MB1' and input.UserInputType == Enum.UserInputType.MouseButton1 then fire = true
+                    elseif key == 'MB2' and input.UserInputType == Enum.UserInputType.MouseButton2 then fire = true
+                    elseif key == 'Touch' and input.UserInputType == Enum.UserInputType.Touch then fire = true
+                    elseif input.UserInputType == Enum.UserInputType.Keyboard and input.KeyCode.Name == key then fire = true
+                    end
+                    if fire then
                         keyPicker.Toggled = not keyPicker.Toggled
                         keyPicker:DoClick()
                     end
@@ -1557,7 +1596,7 @@ do
 
         keyPicker:Update()
         Options[idx] = keyPicker
-        return self
+        return keyPicker
     end
 
     BaseAddons.__index = Funcs
@@ -1681,7 +1720,7 @@ do
 
     function Funcs:AddButton(...)
         local button = {}
-        local function parse(class, obj, ...)
+        local function parse(_, obj, ...)
             local props = select(1, ...)
             if type(props) == 'table' then
                 obj.Text = props.Text
@@ -1745,7 +1784,7 @@ do
                     bindable:Fire(type(validator) == 'function' and validator(...) or false)
                 end)
                 task.delay(timeout, function()
-                    conn:disconnect()
+                    pcall(function() conn:Disconnect() end)
                     bindable:Fire(false)
                 end)
                 return bindable.Event:Wait()
@@ -1921,6 +1960,7 @@ do
             box.Text = text
             Library:SafeCallback(textbox.Callback, textbox.Value)
             Library:SafeCallback(textbox.Changed, textbox.Value)
+            Library:MarkAutoSaveDirty()
         end
 
         if textbox.Finished then
@@ -1931,8 +1971,8 @@ do
             end))
         else
             Library:GiveSignal(box:GetPropertyChangedSignal('Text'):Connect(function()
+                if textbox.Value == box.Text then return end
                 textbox:SetValue(box.Text)
-                Library:AttemptSave()
             end))
         end
 
@@ -2049,12 +2089,13 @@ do
             for _, a in next, toggle.Addons do
                 if a.Type == 'KeyPicker' and a.SyncToggleState then
                     a.Toggled = v
-                    a:Update()
+                    if a.Update then a:Update() end
                 end
             end
             Library:SafeCallback(toggle.Callback, toggle.Value)
             Library:SafeCallback(toggle.Changed, toggle.Value)
             Library:UpdateDependencyBoxes()
+            Library:MarkAutoSaveDirty()
         end
         Library:GiveSignal(region.InputBegan:Connect(function(input)
             if (input.UserInputType == Enum.UserInputType.MouseButton1
@@ -2194,6 +2235,7 @@ do
             slider:Display()
             Library:SafeCallback(slider.Callback, slider.Value)
             Library:SafeCallback(slider.Changed, slider.Value)
+            Library:MarkAutoSaveDirty()
         end
         Library:GiveSignal(sliderInner.InputBegan:Connect(function(input)
             if (input.UserInputType == Enum.UserInputType.MouseButton1
@@ -2486,8 +2528,10 @@ do
         function dropdown:SetValue(v)
             if dropdown.Multi then
                 local t = {}
-                for value, on in next, v do
-                    if table.find(dropdown.Values, value) then t[value] = true end
+                if type(v) == 'table' then
+                    for value, _ in next, v do
+                        if table.find(dropdown.Values, value) then t[value] = true end
+                    end
                 end
                 dropdown.Value = t
             else
@@ -2498,8 +2542,10 @@ do
                 end
             end
             dropdown:BuildDropdownList()
+            dropdown:Display()
             Library:SafeCallback(dropdown.Callback, dropdown.Value)
             Library:SafeCallback(dropdown.Changed, dropdown.Value)
+            Library:MarkAutoSaveDirty()
         end
 
         Library:GiveSignal(outer.InputBegan:Connect(function(input)
@@ -2618,7 +2664,7 @@ do
 end
 
 -- ─────────────────────────────────────────────
---  Notifications, watermark, keybind panel
+--  Notifications / watermark / keybind panel
 -- ─────────────────────────────────────────────
 do
     Library.NotificationArea = Library:Create('Frame', {
@@ -2753,7 +2799,7 @@ end
 
 function Library:RefreshKeybinds()
     for _, kp in ipairs(Library.KeyPickerList) do
-        if not kp.NoUI then
+        if not kp.NoUI and kp.Update then
             pcall(function() kp:Update() end)
         end
     end
@@ -3338,18 +3384,40 @@ function Library:CreateWindow(...)
     function Library:Toggle()
         Library.Toggled = not Library.Toggled
         modal.Modal = Library.Toggled
+        outer.Visible = Library.Toggled
         if Library.Toggled then
-            outer.Visible = true
-            -- smooth fade-in
-            local startT = 0
-            outer.BackgroundTransparency = 1
             task.spawn(function()
-                while startT < 0.12 do
-                    startT = startT + Heartbeat:Wait()
+                local state = InputService.MouseIconEnabled
+                local ok1, cursor = pcall(function() return Drawing.new('Triangle') end)
+                local ok2, outline = pcall(function() return Drawing.new('Triangle') end)
+                if not ok1 or not ok2 then return end
+                cursor.Thickness = 1
+                cursor.Filled = true
+                cursor.Visible = true
+                outline.Thickness = 1
+                outline.Filled = false
+                outline.Color = Color3.new(0, 0, 0)
+                outline.Visible = true
+                local acc = 0
+                while Library.Toggled and ScreenGui.Parent do
+                    InputService.MouseIconEnabled = false
+                    acc = acc + PreRender:Wait()
+                    if acc >= 1 / 60 then
+                        acc = 0
+                        local m = InputService:GetMouseLocation()
+                        cursor.Color = Library.AccentColor
+                        cursor.PointA = Vector2.new(m.X, m.Y)
+                        cursor.PointB = Vector2.new(m.X + 16, m.Y + 6)
+                        cursor.PointC = Vector2.new(m.X + 6, m.Y + 16)
+                        outline.PointA = cursor.PointA
+                        outline.PointB = cursor.PointB
+                        outline.PointC = cursor.PointC
+                    end
                 end
+                InputService.MouseIconEnabled = state
+                pcall(function() cursor:Remove() end)
+                pcall(function() outline:Remove() end)
             end)
-        else
-            outer.Visible = false
         end
         Library:UpdateBlur()
     end
@@ -3495,10 +3563,13 @@ end
 
 Library:UpdateColorsUsingRegistry()
 
--- ─────────────────────────────────────────────
---  Auto-load last config on boot
--- ─────────────────────────────────────────────
-Library:RunAutoLoad()
+-- Apply autotheme if it exists
+if IsFile(THEME_DIR .. '/autotheme.json') then
+    pcall(function() Library:LoadTheme('autotheme') end)
+end
+
+-- Run autoload
+pcall(function() Library:RunAutoLoad() end)
 
 getgenv().Library = Library
 return Library
