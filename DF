@@ -3573,3 +3573,256 @@ pcall(function() Library:RunAutoLoad() end)
 
 getgenv().Library = Library
 return Library
+
+
+local Window = Library:CreateWindow({
+    Title = 'Unnamed Enhancements',
+    Center = true,
+    AutoShow = true,
+    Size = UDim2.fromOffset(560, 600),
+    Resizable = true,
+})
+
+local Tabs = {
+    Aim   = Window:AddTab('Aimbot'),
+    ESP   = Window:AddTab('ESP'),
+    World = Window:AddTab('World'),
+    Vis   = Window:AddTab('Visuals'),
+    Fun   = Window:AddTab('Fun'),
+    UIS   = Window:AddTab('UI Settings'),
+}
+
+-- ═══ MENU ═══
+local MenuBox = Tabs.UIS:AddLeftGroupbox('Menu')
+
+local menuBind = MenuBox:AddKeyPicker('MenuBind', {
+    Default = 'RightControl',
+    Mode = 'Toggle',
+    Text = 'Menu bind',
+    NoUI = true,
+    Callback = function() Library:Toggle() end,
+})
+Library.ToggleKeybind = menuBind
+
+local autosaveLabel = MenuBox:AddLabel(
+    'AutoSave: ' .. (Library.AutoSaveEnabled and 'ON' or 'OFF')
+      .. ' | autoload: ' .. (Library:GetAutoLoadName() or 'none')
+)
+
+MenuBox:AddButton({
+    Text = 'Open Keybind Menu',
+    Func = function() Library.KeybindFrame.Visible = not Library.KeybindFrame.Visible end,
+})
+MenuBox:AddButton({
+    Text = 'Save now',
+    Func = function()
+        Library:SaveConfig(Library.AutoSaveName, true)
+        autosaveLabel:SetText('AutoSave: ' .. (Library.AutoSaveEnabled and 'ON' or 'OFF')
+            .. ' | last save: ' .. os.date('%H:%M:%S'))
+        Library:Notify('Saved.', 2)
+    end,
+})
+MenuBox:AddButton({
+    Text = 'Unload',
+    DoubleClick = true,
+    Func = function()
+        pcall(function() Library:SaveConfig(Library.AutoSaveName, true) end)
+        Library:Unload()
+    end,
+})
+
+-- ═══ THEMES ═══
+local ThemeBox = Tabs.UIS:AddLeftGroupbox('Themes')
+local themeKeys = {
+    {'Background color', 'BackgroundColor'},
+    {'Main color',       'MainColor'},
+    {'Accent color',     'AccentColor'},
+    {'Outline color',    'OutlineColor'},
+    {'Font color',       'FontColor'},
+}
+for _, pair in ipairs(themeKeys) do
+    ThemeBox:AddColorPicker(pair[2] .. 'Picker', {
+        Default = Library[pair[2]],
+        Title = pair[1],
+        Transparency = 0,
+        Callback = function(c)
+            Library[pair[2]] = c
+            if pair[2] == 'AccentColor' then
+                Library.AccentColorDark = Library:GetDarkerColor(c)
+            end
+            Library:UpdateColorsUsingRegistry()
+            pcall(function() Library:SaveTheme('autotheme') end)
+            Library:MarkAutoSaveDirty()
+        end,
+    })
+end
+ThemeBox:AddDivider()
+
+local themeList = ThemeBox:AddDropdown('ThemeList', {
+    Values = Library:ListThemes(),
+    Default = 'Default',
+    Text = 'Theme list',
+    Callback = function(v)
+        Library:LoadTheme(v)
+        pcall(function() Library:SaveTheme('autotheme') end)
+    end,
+})
+ThemeBox:AddButton({
+    Text = 'Set as default',
+    Func = function()
+        Library:SaveTheme('__default')
+        Library:Notify('Default theme saved.', 2.5)
+    end,
+})
+ThemeBox:AddDivider()
+
+local customName = ThemeBox:AddInput('CustomThemeName', {
+    Default = '',
+    Text = 'Custom theme name',
+    Placeholder = 'my_theme',
+})
+local customList = ThemeBox:AddDropdown('CustomThemes', {
+    Values = Library:ListThemes(),
+    Default = '',
+    Text = 'Custom themes',
+    AllowNull = true,
+    Callback = function(v) customName:SetValue(v or '') end,
+})
+ThemeBox:AddButton({
+    Text = 'Save theme',
+    Func = function()
+        Library:SaveTheme(customName.Value)
+        customList:SetValues(Library:ListThemes())
+        themeList:SetValues(Library:ListThemes())
+        Library:Notify('Theme saved: ' .. customName.Value, 2.5)
+    end,
+})
+ThemeBox:AddButton({
+    Text = 'Load theme',
+    Func = function() Library:LoadTheme(customName.Value) end,
+})
+ThemeBox:AddButton({
+    Text = 'Refresh list',
+    Func = function()
+        customList:SetValues(Library:ListThemes())
+        themeList:SetValues(Library:ListThemes())
+    end,
+})
+
+-- ═══ CONFIGURATION ═══
+local ConfigBox = Tabs.UIS:AddRightGroupbox('Configuration')
+
+ConfigBox:AddToggle('AutoSaveToggle', {
+    Text = 'AutoSave',
+    Default = Library.AutoSaveEnabled,
+    Tooltip = 'Silently saves options shortly after any change.',
+    Callback = function(v)
+        Library:SetAutoSave(v)
+        autosaveLabel:SetText('AutoSave: ' .. (v and 'ON' or 'OFF')
+            .. ' | autoload: ' .. (Library:GetAutoLoadName() or 'none'))
+    end,
+})
+ConfigBox:AddSlider('AutoSaveDebounce', {
+    Text = 'AutoSave debounce',
+    Default = 0.5,
+    Min = 0.1,
+    Max = 3,
+    Rounding = 1,
+    Suffix = 's',
+    Callback = function(v) Library:SetAutoSaveDebounce(v) end,
+})
+ConfigBox:AddDivider()
+
+local configName = ConfigBox:AddInput('ConfigName', {
+    Default = 'default',
+    Text = 'Config name',
+    Placeholder = 'config_name',
+})
+local configList = ConfigBox:AddDropdown('ConfigList', {
+    Values = Library:ListConfigs(),
+    Default = '',
+    Text = 'Config list',
+    AllowNull = true,
+    Callback = function(v) configName:SetValue(v or '') end,
+})
+ConfigBox:AddButton({
+    Text = 'Create config',
+    Func = function()
+        Library:SaveConfig(configName.Value)
+        configList:SetValues(Library:ListConfigs())
+    end,
+})
+ConfigBox:AddButton({
+    Text = 'Load config',
+    Func = function() Library:LoadConfig(configName.Value) end,
+})
+ConfigBox:AddButton({
+    Text = 'Overwrite config',
+    Func = function() Library:SaveConfig(configName.Value) end,
+})
+ConfigBox:AddButton({
+    Text = 'Refresh list',
+    Func = function() configList:SetValues(Library:ListConfigs()) end,
+})
+ConfigBox:AddButton({
+    Text = 'Set autoload',
+    Func = function()
+        Library:SetAutoLoad(configName.Value)
+        Library:Notify('Autoload: ' .. configName.Value, 2.5)
+        autosaveLabel:SetText('AutoSave: ' .. (Library.AutoSaveEnabled and 'ON' or 'OFF')
+            .. ' | autoload: ' .. configName.Value)
+    end,
+})
+ConfigBox:AddButton({
+    Text = 'Remove autoload',
+    Func = function()
+        Library:SetAutoLoad(nil)
+        Library:Notify('Autoload removed.', 2.5)
+        autosaveLabel:SetText('AutoSave: ' .. (Library.AutoSaveEnabled and 'ON' or 'OFF')
+            .. ' | autoload: none')
+    end,
+})
+ConfigBox:AddButton({
+    Text = 'Delete config',
+    DoubleClick = true,
+    Func = function()
+        Library:DeleteConfig(configName.Value)
+        configList:SetValues(Library:ListConfigs())
+        Library:Notify('Deleted: ' .. configName.Value, 2.5)
+    end,
+})
+
+-- ═══ PERFORMANCE ═══
+local PerfBox = Tabs.UIS:AddRightGroupbox('Performance')
+
+PerfBox:AddToggle('BlurToggle', {
+    Text = 'Use Blur Effect',
+    Default = Library.UseBlur,
+    Callback = function(v) Library.UseBlur = v; Library:UpdateBlur() end,
+})
+PerfBox:AddSlider('BlurSize', {
+    Text = 'Blur size',
+    Default = 15, Min = 1, Max = 30, Rounding = 0,
+    Callback = function(v) Library.BlurSize = v; Library:UpdateBlur() end,
+})
+PerfBox:AddToggle('WireframeToggle', {
+    Text = 'Wireframe Drag',
+    Default = Library.WireframeDrag,
+    Callback = function(v) Library.WireframeDrag = v end,
+})
+PerfBox:AddSlider('TooltipRate', {
+    Text = 'Tooltip update (Hz)',
+    Default = 60, Min = 15, Max = 120, Rounding = 0,
+    Callback = function(v) Library.TooltipRate = v end,
+})
+PerfBox:AddSlider('NotifyDuration', {
+    Text = 'Notify duration (s)',
+    Default = 5, Min = 1, Max = 15, Rounding = 0, Suffix = 's',
+    Callback = function(v) Library.NotifyDuration = v end,
+})
+PerfBox:AddDropdown('KeybindModeDrop', {
+    Values = {'All', 'Active', 'Toggled'},
+    Default = 'All',
+    Text = 'Keybind mode',
+    Callback = function(v) Library:SetKeybindMode(v) end,
+})
