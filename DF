@@ -1,23 +1,36 @@
 --!strict
--- Linoria Reforged | White Theme | Pooled | Optimized
+-- Linoria Reforged v2 | White Theme | Pooled | Profile-First
 -- He's build. No blue. No leaks. No lag.
 
-local InputService   = game:GetService('UserInputService')
-local TextService    = game:GetService('TextService')
-local CoreGui        = game:GetService('CoreGui')
-local Teams          = game:GetService('Teams')
-local Players        = game:GetService('Players')
-local RunService     = game:GetService('RunService')
-local TweenService   = game:GetService('TweenService')
-local Lighting       = game:GetService('Lighting')
-local HttpService    = game:GetService('HttpService')
+local InputService = game:GetService('UserInputService')
+local TextService  = game:GetService('TextService')
+local CoreGui      = game:GetService('CoreGui')
+local Teams        = game:GetService('Teams')
+local Players      = game:GetService('Players')
+local RunService   = game:GetService('RunService')
+local TweenService = game:GetService('TweenService')
+local Lighting     = game:GetService('Lighting')
+local HttpService  = game:GetService('HttpService')
 
-local RenderStepped  = RunService.RenderStepped
-local Heartbeat      = RunService.Heartbeat
-local LocalPlayer    = Players.LocalPlayer
-local Mouse          = LocalPlayer:GetMouse()
+local PreRender    = RunService.PreRender
+local Heartbeat    = RunService.Heartbeat
+local LocalPlayer  = Players.LocalPlayer
+local Mouse        = LocalPlayer:GetMouse()
 
 local ProtectGui = protectgui or (syn and syn.protect_gui) or function() end
+local WriteFile  = writefile or (syn and syn.write_file) or function() end
+local ReadFile   = readfile or (syn and syn.read_file) or function() return nil end
+local IsFile     = isfile or (syn and syn.is_file) or function() return false end
+local MakeFolder = makefolder or (syn and syn.make_folder) or function() end
+local IsFolder   = isfolder or (syn and syn.is_folder) or function() return false end
+local ListFiles  = listfiles or (syn and syn.list_files) or function() return {} end
+
+local FOLDER_NAME = 'LinoriaReforged'
+if not IsFolder(FOLDER_NAME) then pcall(MakeFolder, FOLDER_NAME) end
+local CONFIG_DIR = FOLDER_NAME .. '/configs'
+local THEME_DIR  = FOLDER_NAME .. '/themes'
+if not IsFolder(CONFIG_DIR) then pcall(MakeFolder, CONFIG_DIR) end
+if not IsFolder(THEME_DIR)  then pcall(MakeFolder, THEME_DIR)  end
 
 -- ─────────────────────────────────────────────
 --  Boot GUI
@@ -26,6 +39,7 @@ local ScreenGui = Instance.new('ScreenGui')
 ScreenGui.Name = 'LinoriaReforged'
 ScreenGui.ZIndexBehavior = Enum.ZIndexBehavior.Global
 ScreenGui.IgnoreGuiInset = true
+ScreenGui.ResetOnSpawn = false
 pcall(ProtectGui, ScreenGui)
 ScreenGui.Parent = CoreGui
 
@@ -38,8 +52,8 @@ getgenv().Options = Options
 --  Library core
 -- ─────────────────────────────────────────────
 local Library = {
-    Registry        = setmetatable({}, {__mode = 'v'}),   -- weak values
-    RegistryMap     = setmetatable({}, {__mode = 'k'}),   -- weak keys
+    Registry        = setmetatable({}, {__mode = 'v'}),
+    RegistryMap     = setmetatable({}, {__mode = 'k'}),
     HudRegistry     = {},
 
     -- WHITE THEME — NO BLUE ANYWHERE
@@ -60,11 +74,16 @@ local Library = {
     Signals         = {},
     ScreenGui       = ScreenGui,
 
-    Toggled        = false,
-    WireframeDrag  = true,
-    UseBlur        = false,
-    BlurSize       = 15,
-    KeybindMode    = 'All',
+    Toggled       = false,
+    WireframeDrag = true,
+    UseBlur       = false,
+    BlurSize      = 15,
+    KeybindMode   = 'All',
+
+    -- perf flags
+    TooltipRate   = 60,   -- Hz
+    NotifyDuration = 5,
+    ShowKeybindFrame = true,
 
     NotifyConfig = {
         Alignment = 'Left',
@@ -75,16 +94,19 @@ local Library = {
 
     _textCache      = {},
     _textCacheOrder = {},
-    _textCacheMax   = 512,
+    _textCacheMax   = 1024,
     _tweenPool      = {},
-    _tweenPoolMax   = 64,
-    _notifyPool     = {},
-    _notifyPoolMax  = 8,
+    _tweenPoolMax   = 96,
     _tooltipFrame   = 0,
     _hoverTables    = {},
+    _colorWatchers  = {},
+    _themeSave      = {},
+    _currentTheme   = 'Default',
+    _autoloadName   = 'none',
 }
 
 Library.KeyPickerList = {}
+getgenv().Library = Library
 
 -- ─────────────────────────────────────────────
 --  Blur
@@ -110,24 +132,21 @@ function Library:UpdateBlur()
 end
 
 -- ─────────────────────────────────────────────
---  Tween pool (no GC churn)
+--  Tween pool (per-target cancel, bounded)
 -- ─────────────────────────────────────────────
 function Library:_Tween(instance, info, props)
-    local key = instance
-    local existing = Library._tweenPool[key]
-    if existing then
-        pcall(function() existing:Cancel() end)
-    end
+    local existing = Library._tweenPool[instance]
+    if existing then pcall(function() existing:Cancel() end) end
     local tween = TweenService:Create(instance, info, props)
-    Library._tweenPool[key] = tween
-    -- trim pool
+    Library._tweenPool[instance] = tween
     local n = 0
     for _ in pairs(Library._tweenPool) do n = n + 1 end
     if n > Library._tweenPoolMax then
+        local dropped = 0
         for k in pairs(Library._tweenPool) do
             Library._tweenPool[k] = nil
-            n = n - 1
-            if n <= Library._tweenPoolMax then break end
+            dropped = dropped + 1
+            if dropped >= (n - Library._tweenPoolMax) then break end
         end
     end
     tween:Play()
@@ -176,9 +195,6 @@ end
 
 function Library:OnUnload(cb) Library.OnUnload = cb end
 
--- ─────────────────────────────────────────────
---  Safe callback
--- ─────────────────────────────────────────────
 function Library:SafeCallback(f, ...)
     if not f then return end
     if not Library.NotifyOnError then return f(...) end
@@ -252,17 +268,18 @@ end
 function Library:UpdateColorsUsingRegistry()
     Library.AccentColorDark = Library:GetDarkerColor(Library.AccentColor)
     for _, obj in next, Library.Registry do
-        for prop, colorKey in next, obj.Properties do
-            if type(colorKey) == 'string' then
-                pcall(function() obj.Instance[prop] = Library[colorKey] end)
-            elseif type(colorKey) == 'function' then
-                pcall(function() obj.Instance[prop] = colorKey() end)
+        local inst = obj.Instance
+        if inst.Parent then
+            for prop, colorKey in next, obj.Properties do
+                if type(colorKey) == 'string' then
+                    local c = Library[colorKey]
+                    if c then inst[prop] = c end
+                end
             end
         end
     end
 end
 
--- auto-clean on destroy
 Library:GiveSignal(ScreenGui.DescendantRemoving:Connect(function(inst)
     if Library.RegistryMap[inst] then
         Library:RemoveFromRegistry(inst)
@@ -274,10 +291,12 @@ end))
 -- ─────────────────────────────────────────────
 function Library:MouseIsOverOpenedFrame()
     for frame in next, Library.OpenedFrames do
-        local ap, as = frame.AbsolutePosition, frame.AbsoluteSize
-        if Mouse.X >= ap.X and Mouse.X <= ap.X + as.X
-            and Mouse.Y >= ap.Y and Mouse.Y <= ap.Y + as.Y then
-            return true
+        if frame.Parent then
+            local ap, as = frame.AbsolutePosition, frame.AbsoluteSize
+            if Mouse.X >= ap.X and Mouse.X <= ap.X + as.X
+                and Mouse.Y >= ap.Y and Mouse.Y <= ap.Y + as.Y then
+                return true
+            end
         end
     end
     return false
@@ -304,7 +323,7 @@ end
 do
     local acc = 0
     local hue = 0
-    Library:GiveSignal(RenderStepped:Connect(function(dt)
+    Library:GiveSignal(Heartbeat:Connect(function(dt)
         acc = acc + dt
         if acc < 1 / 30 then return end
         acc = 0
@@ -332,7 +351,7 @@ local function GetTeamsString()
 end
 
 -- ─────────────────────────────────────────────
---  Draggable (uses pooled frame, debounced)
+--  Draggable (cached start pos, no per-frame alloc)
 -- ─────────────────────────────────────────────
 function Library:MakeDraggable(instance, cutoff, isWindow)
     instance.Active = true
@@ -341,6 +360,8 @@ function Library:MakeDraggable(instance, cutoff, isWindow)
         if input.UserInputType ~= Enum.UserInputType.MouseButton1
             and input.UserInputType ~= Enum.UserInputType.Touch then return end
         local startPos = instance.Position
+        local startScale = Vector2.new(startPos.X.Scale, startPos.Y.Scale)
+        local startOffset = Vector2.new(startPos.X.Offset, startPos.Y.Offset)
         local dragStart = input.Position
         if (dragStart.Y - instance.AbsolutePosition.Y) > (cutoff or 40) then return end
 
@@ -349,9 +370,10 @@ function Library:MakeDraggable(instance, cutoff, isWindow)
 
         cc = Library:GiveSignal(InputService.InputChanged:Connect(function(ch)
             if ch.UserInputType ~= Enum.UserInputType.MouseMovement and ch ~= input then return end
-            local delta = ch.Position - dragStart
+            local dx = ch.Position.X - dragStart.X
+            local dy = ch.Position.Y - dragStart.Y
             if isWindow and Library.WireframeDrag then
-                if not hasMoved and delta.Magnitude > 2 then
+                if not hasMoved and (dx * dx + dy * dy) > 4 then
                     hasMoved = true
                     wireframe = Library:Create('Frame', {
                         Size = instance.Size,
@@ -371,14 +393,14 @@ function Library:MakeDraggable(instance, cutoff, isWindow)
                 end
                 if hasMoved and wireframe then
                     wireframe.Position = UDim2.new(
-                        startPos.X.Scale, startPos.X.Offset + delta.X,
-                        startPos.Y.Scale, startPos.Y.Offset + delta.Y
+                        startScale.X, startOffset.X + dx,
+                        startScale.Y, startOffset.Y + dy
                     )
                 end
             else
                 instance.Position = UDim2.new(
-                    startPos.X.Scale, startPos.X.Offset + delta.X,
-                    startPos.Y.Scale, startPos.Y.Offset + delta.Y
+                    startScale.X, startOffset.X + dx,
+                    startScale.Y, startOffset.Y + dy
                 )
             end
         end))
@@ -431,16 +453,18 @@ function Library:MakeResizable(instance, minSize, maxSize)
         if input.UserInputType ~= Enum.UserInputType.MouseButton1
             and input.UserInputType ~= Enum.UserInputType.Touch then return end
         local startSize = instance.Size
+        local sX, sY = startSize.X.Offset, startSize.Y.Offset
         local dragStart = input.Position
         local wireframe
         local cc, ec
 
         cc = Library:GiveSignal(InputService.InputChanged:Connect(function(ch)
             if ch.UserInputType ~= Enum.UserInputType.MouseMovement and ch ~= input then return end
-            local delta = ch.Position - dragStart
-            if delta.Magnitude <= 2 then return end
-            local w = math.clamp(startSize.X.Offset + delta.X, minSize.X, maxSize.X)
-            local h = math.clamp(startSize.Y.Offset + delta.Y, minSize.Y, maxSize.Y)
+            local dx = ch.Position.X - dragStart.X
+            local dy = ch.Position.Y - dragStart.Y
+            if (dx * dx + dy * dy) <= 4 then return end
+            local w = math.clamp(sX + dx, minSize.X, maxSize.X)
+            local h = math.clamp(sY + dy, minSize.Y, maxSize.Y)
             local newSize = UDim2.fromOffset(w, h)
             if Library.WireframeDrag then
                 if not wireframe then
@@ -479,7 +503,7 @@ function Library:MakeResizable(instance, minSize, maxSize)
 end
 
 -- ─────────────────────────────────────────────
---  Tooltip (single shared frame, 30fps)
+--  Tooltip (single shared frame)
 -- ─────────────────────────────────────────────
 do
     local tooltip = Library:Create('Frame', {
@@ -506,10 +530,11 @@ do
     Library._tooltipActive = false
 
     local acc = 0
-    Library:GiveSignal(RenderStepped:Connect(function(dt)
+    Library:GiveSignal(Heartbeat:Connect(function(dt)
         if not Library._tooltipActive then return end
         acc = acc + dt
-        if acc < 1 / 30 then return end
+        local step = 1 / Library.TooltipRate
+        if acc < step then return end
         acc = 0
         tooltip.Position = UDim2.fromOffset(Mouse.X + 15, Mouse.Y + 12)
     end))
@@ -517,7 +542,6 @@ end
 
 function Library:AddToolTip(text, hoverInstance)
     local x, y = Library:GetTextBounds(text, Library.Font, Library.FontSize)
-
     Library:GiveSignal(hoverInstance.MouseEnter:Connect(function()
         if Library:MouseIsOverOpenedFrame() then return end
         Library._tooltipLabel.Text = text
@@ -526,7 +550,6 @@ function Library:AddToolTip(text, hoverInstance)
         Library._tooltip.Visible = true
         Library._tooltipActive = true
     end))
-
     Library:GiveSignal(hoverInstance.MouseLeave:Connect(function()
         Library._tooltip.Visible = false
         Library._tooltipActive = false
@@ -534,7 +557,7 @@ function Library:AddToolTip(text, hoverInstance)
 end
 
 -- ─────────────────────────────────────────────
---  Hover highlight (pre-built tables, no alloc)
+--  Hover highlight
 -- ─────────────────────────────────────────────
 function Library:OnHighlight(hoverInstance, targetInstance, hoverProps, defaultProps)
     Library:GiveSignal(hoverInstance.MouseEnter:Connect(function()
@@ -551,6 +574,137 @@ function Library:OnHighlight(hoverInstance, targetInstance, hoverProps, defaultP
             if reg and reg.Properties[prop] then reg.Properties[prop] = colorKey end
         end
     end))
+end
+
+-- ─────────────────────────────────────────────
+--  Theme / Config persistence
+-- ─────────────────────────────────────────────
+local ThemeKeys = {
+    'FontColor', 'MainColor', 'BackgroundColor', 'AccentColor',
+    'OutlineColor', 'RiskColor',
+}
+
+function Library:CaptureTheme()
+    local t = {}
+    for _, k in ipairs(ThemeKeys) do
+        t[k] = Library[k]:ToHex()
+    end
+    return t
+end
+
+function Library:ApplyTheme(t)
+    if type(t) ~= 'table' then return end
+    for _, k in ipairs(ThemeKeys) do
+        if type(t[k]) == 'string' then
+            local ok, c = pcall(Color3.fromHex, t[k])
+            if ok and typeof(c) == 'Color3' then Library[k] = c end
+        end
+    end
+    Library:UpdateColorsUsingRegistry()
+end
+
+function Library:SaveTheme(name)
+    if not name or name == '' then return end
+    local data = HttpService:JSONEncode(Library:CaptureTheme())
+    pcall(WriteFile, THEME_DIR .. '/' .. name .. '.json', data)
+end
+
+function Library:LoadTheme(name)
+    local path = THEME_DIR .. '/' .. name .. '.json'
+    if not IsFile(path) then return false end
+    local ok, raw = pcall(ReadFile, path)
+    if not ok or not raw then return false end
+    local ok2, decoded = pcall(HttpService.JSONDecode, HttpService, raw)
+    if not ok2 then return false end
+    Library:ApplyTheme(decoded)
+    Library._currentTheme = name
+    return true
+end
+
+function Library:ListThemes()
+    local out = {'Default'}
+    local ok, files = pcall(ListFiles, THEME_DIR)
+    if ok and files then
+        for _, f in ipairs(files) do
+            local name = f:match('([^/\\]+)%.json$')
+            if name then table.insert(out, name) end
+        end
+    end
+    return out
+end
+
+function Library:ListConfigs()
+    local out = {}
+    local ok, files = pcall(ListFiles, CONFIG_DIR)
+    if ok and files then
+        for _, f in ipairs(files) do
+            local name = f:match('([^/\\]+)%.json$')
+            if name then table.insert(out, name) end
+        end
+    end
+    return out
+end
+
+function Library:SaveConfig(name)
+    if not name or name == '' then return end
+    local data = {}
+    for idx, opt in pairs(Options) do
+        if opt.Type == 'Toggle' then
+            data[idx] = {Type = 'Toggle', Value = opt.Value}
+        elseif opt.Type == 'Slider' then
+            data[idx] = {Type = 'Slider', Value = opt.Value}
+        elseif opt.Type == 'Dropdown' then
+            data[idx] = {Type = 'Dropdown', Value = opt.Value}
+        elseif opt.Type == 'Input' then
+            data[idx] = {Type = 'Input', Value = opt.Value}
+        elseif opt.Type == 'KeyPicker' then
+            data[idx] = {Type = 'KeyPicker', Value = opt.Value, Mode = opt.Mode}
+        elseif opt.Type == 'ColorPicker' then
+            data[idx] = {Type = 'ColorPicker', Value = opt.Value:ToHex()}
+        end
+    end
+    data.__theme = Library:CaptureTheme()
+    pcall(WriteFile, CONFIG_DIR .. '/' .. name .. '.json', HttpService:JSONEncode(data))
+end
+
+function Library:LoadConfig(name)
+    local path = CONFIG_DIR .. '/' .. name .. '.json'
+    if not IsFile(path) then return false end
+    local ok, raw = pcall(ReadFile, path)
+    if not ok or not raw then return false end
+    local ok2, data = pcall(HttpService.JSONDecode, HttpService, raw)
+    if not ok2 or type(data) ~= 'table' then return false end
+
+    if data.__theme then Library:ApplyTheme(data.__theme) end
+
+    for idx, entry in pairs(data) do
+        if idx ~= '__theme' and type(entry) == 'table' and Options[idx] then
+            local opt = Options[idx]
+            if entry.Type == 'Toggle' and opt.SetValue then
+                opt:SetValue(entry.Value)
+            elseif entry.Type == 'Slider' and opt.SetValue then
+                opt:SetValue(entry.Value)
+            elseif entry.Type == 'Dropdown' and opt.SetValue then
+                opt:SetValue(entry.Value)
+            elseif entry.Type == 'Input' and opt.SetValue then
+                opt:SetValue(entry.Value)
+            elseif entry.Type == 'KeyPicker' and opt.SetValue then
+                opt:SetValue({entry.Value, entry.Mode or 'Toggle'})
+            elseif entry.Type == 'ColorPicker' then
+                local okc, c = pcall(Color3.fromHex, entry.Value)
+                if okc and typeof(c) == 'Color3' and opt.SetValueRGB then
+                    opt:SetValueRGB(c)
+                end
+            end
+        end
+    end
+    Library._autoloadName = name
+    return true
+end
+
+function Library:DeleteConfig(name)
+    local path = CONFIG_DIR .. '/' .. name .. '.json'
+    if IsFile(path) then pcall(delfile, path) end
 end
 
 -- ─────────────────────────────────────────────
@@ -882,11 +1036,12 @@ do
         Library:GiveSignal(svMap.InputBegan:Connect(function(input)
             if input.UserInputType ~= Enum.UserInputType.MouseButton1
                 and input.UserInputType ~= Enum.UserInputType.Touch then return end
+            local absPos, absSize
             local function update(x, y)
-                local minX = svMap.AbsolutePosition.X
-                local maxX = minX + svMap.AbsoluteSize.X
-                local minY = svMap.AbsolutePosition.Y
-                local maxY = minY + svMap.AbsoluteSize.Y
+                absPos = absPos or svMap.AbsolutePosition
+                absSize = absSize or svMap.AbsoluteSize
+                local minX, maxX = absPos.X, absPos.X + absSize.X
+                local minY, maxY = absPos.Y, absPos.Y + absSize.Y
                 local mx = math.clamp(x, minX, maxX)
                 local my = math.clamp(y, minY, maxY)
                 picker.Sat = (mx - minX) / (maxX - minX)
@@ -911,9 +1066,11 @@ do
         Library:GiveSignal(hueInner.InputBegan:Connect(function(input)
             if input.UserInputType ~= Enum.UserInputType.MouseButton1
                 and input.UserInputType ~= Enum.UserInputType.Touch then return end
+            local absPos, absSize
             local function update(y)
-                local minY = hueInner.AbsolutePosition.Y
-                local maxY = minY + hueInner.AbsoluteSize.Y
+                absPos = absPos or hueInner.AbsolutePosition
+                absSize = absSize or hueInner.AbsoluteSize
+                local minY, maxY = absPos.Y, absPos.Y + absSize.Y
                 local my = math.clamp(y, minY, maxY)
                 picker.Hue = (my - minY) / (maxY - minY)
                 picker:Display()
@@ -945,9 +1102,11 @@ do
             Library:GiveSignal(tInner.InputBegan:Connect(function(input)
                 if input.UserInputType ~= Enum.UserInputType.MouseButton1
                     and input.UserInputType ~= Enum.UserInputType.Touch then return end
+                local absPos, absSize
                 local function update(x)
-                    local minX = tInner.AbsolutePosition.X
-                    local maxX = minX + tInner.AbsoluteSize.X
+                    absPos = absPos or tInner.AbsolutePosition
+                    absSize = absSize or tInner.AbsoluteSize
+                    local minX, maxX = absPos.X, absPos.X + absSize.X
                     local mx = math.clamp(x, minX, maxX)
                     picker.Transparency = 1 - ((mx - minX) / (maxX - minX))
                     picker:Display()
@@ -1171,7 +1330,7 @@ do
             local key, mode = data[1], data[2]
             displayLabel.Text = key
             keyPicker.Value = key
-            modeButtons[mode]:Select()
+            if mode and modeButtons[mode] then modeButtons[mode]:Select() end
             keyPicker:Update()
         end
 
@@ -1536,7 +1695,6 @@ do
     function Funcs:AddDivider()
         local groupbox = self
         local container = self.Container
-        local divider = {Type = 'Divider'}
         groupbox:AddBlank(2)
         local outer = Library:Create('Frame', {
             BackgroundColor3 = Color3.new(0, 0, 0),
@@ -1922,8 +2080,8 @@ do
             if (input.UserInputType == Enum.UserInputType.MouseButton1
                 or input.UserInputType == Enum.UserInputType.Touch)
                 and not Library:MouseIsOverOpenedFrame() then
+                local gPos = fill.AbsolutePosition.X
                 local function update(x)
-                    local gPos = fill.AbsolutePosition.X
                     local diff = x - gPos
                     local nx = math.clamp(diff, 0, slider.MaxSize)
                     local nv = slider:GetValueFromXOffset(nx)
@@ -2078,10 +2236,12 @@ do
             Size = UDim2.new(1, 0, 1, 0),
             ZIndex = 21,
             Parent = listInner,
-            TopImage = 'rbxasset://textures/ui/Scroll/scroll-middle.png',
-            BottomImage = 'rbxasset://textures/ui/Scroll/scroll-middle.png',
+            TopImage = '',
+            BottomImage = '',
             ScrollBarThickness = 3,
             ScrollBarImageColor3 = Library.AccentColor,
+            ScrollingDirection = Enum.ScrollingDirection.Y,
+            ElasticBehavior = Enum.ElasticBehavior.Never,
         })
         Library:AddToRegistry(scrolling, {ScrollBarImageColor3 = 'AccentColor'})
         Library:Create('UIListLayout', {
@@ -2496,7 +2656,6 @@ function Library:Notify(text, duration)
     local xSize, ySize = Library:GetTextBounds(text, Library.Font, Library.FontSize)
     ySize = ySize + 7
     local barThin = 3
-    local barThick = 3
 
     local outer = Library:Create('Frame', {
         BackgroundTransparency = 1,
@@ -2553,10 +2712,12 @@ function Library:Notify(text, duration)
     local finalWidth = xSize + 8 + 4 + barThin
     Library:_Tween(outer, TweenInfo.new(0.35), {Size = UDim2.new(0, finalWidth, 0, ySize)})
     task.spawn(function()
-        task.wait(duration or 5)
-        Library:_Tween(outer, TweenInfo.new(0.35), {Size = UDim2.new(0, 0, 0, ySize)})
-        task.wait(0.4)
-        outer:Destroy()
+        task.wait(duration or Library.NotifyDuration)
+        if outer.Parent then
+            Library:_Tween(outer, TweenInfo.new(0.35), {Size = UDim2.new(0, 0, 0, ySize)})
+            task.wait(0.4)
+            outer:Destroy()
+        end
     end)
 end
 
@@ -2643,7 +2804,6 @@ function Library:CreateWindow(...)
         mapLabel.Text = ok and info and info.Name or (game.Name or 'Unknown Map')
     end)
 
-    -- WHITE LINE UNDER THE WINDOW TITLE
     local underline = Library:Create('Frame', {
         BackgroundColor3 = Library.AccentColor,
         BorderSizePixel = 0,
@@ -2764,6 +2924,8 @@ function Library:CreateWindow(...)
             BottomImage = '',
             TopImage = '',
             ScrollBarThickness = 0,
+            ScrollingDirection = Enum.ScrollingDirection.Y,
+            ElasticBehavior = Enum.ElasticBehavior.Never,
             ZIndex = 2,
             Parent = tabFrame,
         })
@@ -2776,6 +2938,8 @@ function Library:CreateWindow(...)
             BottomImage = '',
             TopImage = '',
             ScrollBarThickness = 0,
+            ScrollingDirection = Enum.ScrollingDirection.Y,
+            ElasticBehavior = Enum.ElasticBehavior.Never,
             ZIndex = 2,
             Parent = tabFrame,
         })
@@ -2794,7 +2958,7 @@ function Library:CreateWindow(...)
             Parent = rightSide,
         })
         for _, side in next, {leftSide, rightSide} do
-            local layout = side:WaitForChild('UIListLayout', 5)
+            local layout = side:FindFirstChildOfClass('UIListLayout')
             if layout then
                 Library:GiveSignal(layout:GetPropertyChangedSignal('AbsoluteContentSize'):Connect(function()
                     side.CanvasSize = UDim2.fromOffset(0, layout.AbsoluteContentSize.Y)
@@ -3039,6 +3203,7 @@ function Library:CreateWindow(...)
         return tab
     end
 
+    -- ── Modal for toggle-blocking ──
     local modal = Library:Create('TextButton', {
         BackgroundTransparency = 1,
         Size = UDim2.new(0, 0, 0, 0),
@@ -3068,7 +3233,7 @@ function Library:CreateWindow(...)
                 local acc = 0
                 while Library.Toggled and ScreenGui.Parent do
                     InputService.MouseIconEnabled = false
-                    acc = acc + RenderStepped:Wait()
+                    acc = acc + PreRender:Wait()
                     if acc >= 1 / 60 then
                         acc = 0
                         local m = InputService:GetMouseLocation()
@@ -3228,9 +3393,6 @@ if InputService.TouchEnabled then
     end)
 end
 
--- ─────────────────────────────────────────────
---  Export
--- ─────────────────────────────────────────────
 Library:UpdateColorsUsingRegistry()
 getgenv().Library = Library
 return Library
