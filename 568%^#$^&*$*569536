@@ -1,0 +1,2160 @@
+--[[
+    KiciaHook UI Library
+    Usage:
+        local UI = loadstring(game:HttpGet("https://your.link/here.lua"))()
+        local base = UI.new():setLabel("My Script")
+        local tabList = base:newTabList()
+        local main = tabList:newTab("Main"):intoSections()
+        local sec = main:newSection("left", "Section")
+        sec:newToggle("flag"):setLabel("Enable")
+        base:Finish()
+]]
+
+local LIB = {}
+LIB.__index = LIB
+
+do
+    local cloneref = cloneref or function(r) return r end
+    local setidentity = setthreadcontext or setthreadidentity or set_thread_identity or set_thread_context or setidentity
+
+    local RunService       = cloneref(game:GetService("RunService"))
+    local UserInputService = cloneref(game:GetService("UserInputService"))
+    local CoreGui          = cloneref(game:GetService("CoreGui"))
+    local HttpService      = cloneref(game:GetService("HttpService"))
+
+    -- ============================================================
+    -- Trove
+    -- ============================================================
+    local Trove = (function()
+        local FN_MARKER, THREAD_MARKER = newproxy(), newproxy()
+        local GENERIC = table.freeze({ "Destroy", "Disconnect", "destroy", "disconnect" })
+
+        local function getCleanup(object, method)
+            local t = typeof(object)
+            if t == "function" then return FN_MARKER end
+            if t == "thread"   then return THREAD_MARKER end
+            if method then return method end
+            if t == "Instance" then return "Destroy" end
+            if t == "RBXScriptConnection" then return "Disconnect" end
+            if t == "table" then
+                for _, m in GENERIC do
+                    if typeof(object[m]) == "function" then return m end
+                end
+            end
+            error(("failed to get cleanup function for object %s: %s"):format(t, object), 3)
+        end
+
+        local function assertPromise(p)
+            if typeof(p) ~= "table" or typeof(p.getStatus) ~= "function"
+                or typeof(p.finally) ~= "function" or typeof(p.cancel) ~= "function" then
+                error("did not receive a promise as an argument", 3)
+            end
+        end
+
+        local T = {}
+        T.__index = T
+        function T.new()
+            return setmetatable({ _objects = {}, _cleaning = false }, T)
+        end
+        function T:Add(object, method)
+            if self._cleaning then error("cannot call trove:Add() while cleaning", 2) end
+            table.insert(self._objects, { object, getCleanup(object, method) })
+            return object
+        end
+        function T:Clone(instance)
+            if self._cleaning then error("cannot call trove:Clone() while cleaning", 2) end
+            return self:Add(instance:Clone())
+        end
+        function T:Construct(class, ...)
+            if self._cleaning then error("cannot call trove:Construct() while cleaning", 2) end
+            local object
+            local t = type(class)
+            if t == "table" then object = class.new(...)
+            elseif t == "function" then object = class(...) end
+            return self:Add(object)
+        end
+        function T:Connect(signal, fn)
+            if self._cleaning then error("cannot call trove:Connect() while cleaning", 2) end
+            return self:Add(signal:Connect(fn))
+        end
+        function T:BindToRenderStep(name, priority, fn)
+            if self._cleaning then error("cannot call trove:BindToRenderStep() while cleaning", 2) end
+            RunService:BindToRenderStep(name, priority, fn)
+            self:Add(function() RunService:UnbindFromRenderStep(name) end)
+        end
+        function T:AddPromise(promise)
+            if self._cleaning then error("cannot call trove:AddPromise() while cleaning", 2) end
+            assertPromise(promise)
+            if promise:getStatus() == "Started" then
+                promise:finally(function()
+                    if self._cleaning then return end
+                    self:_remove(promise, false)
+                end)
+                self:Add(promise, "cancel")
+            end
+            return promise
+        end
+        function T:Remove(object)
+            if self._cleaning then error("cannot call trove:Remove() while cleaning", 2) end
+            return self:_remove(object, true)
+        end
+        function T:Extend()
+            if self._cleaning then error("cannot call trove:Extend() while cleaning", 2) end
+            return T.new()
+        end
+        function T:Clean()
+            if self._cleaning then return end
+            self._cleaning = true
+            for _, obj in self._objects do
+                self:_cleanup(obj[1], obj[2])
+            end
+            table.clear(self._objects)
+            self._cleaning = false
+        end
+        function T:_remove(object, cleanup)
+            local objects = self._objects
+            for i, obj in ipairs(objects) do
+                if obj[1] == object then
+                    local n = #objects
+                    objects[i] = objects[n]
+                    objects[n] = nil
+                    if cleanup then self:_cleanup(obj[1], obj[2]) end
+                    return true
+                end
+            end
+            return false
+        end
+        function T:_cleanup(object, method)
+            if method == FN_MARKER then
+                object()
+            elseif method == THREAD_MARKER then
+                pcall(task.cancel, object)
+            else
+                object[method](object)
+            end
+        end
+        function T:AttachToInstance(instance)
+            if self._cleaning then error("cannot call trove:AttachToInstance() while cleaning", 2) end
+            if not instance:IsDescendantOf(game) then
+                error("instance is not a descendant of the game hierarchy", 2)
+            end
+            return self:Connect(instance.Destroying, function() self:Destroy() end)
+        end
+        function T:Destroy() self:Clean() end
+        return { new = T.new }
+    end)()
+
+    -- ============================================================
+    -- Signal
+    -- ============================================================
+    local Signal = (function()
+        local freeRunnerThread
+        local function acquire(fn, ...)
+            local t = freeRunnerThread
+            freeRunnerThread = nil
+            fn(...)
+            freeRunnerThread = t
+        end
+        local function runner(...)
+            acquire(...)
+            while true do acquire(coroutine.yield()) end
+        end
+
+        local Connection = {}
+        Connection.__index = Connection
+        function Connection:Disconnect()
+            if not self.Connected then return end
+            self.Connected = false
+            if self._signal._handlerListHead == self then
+                self._signal._handlerListHead = self._next
+            else
+                local prev = self._signal._handlerListHead
+                while prev and prev._next ~= self do prev = prev._next end
+                if prev then prev._next = self._next end
+            end
+        end
+        Connection.Destroy = Connection.Disconnect
+        setmetatable(Connection, {
+            __index = function(_, k) error(("Attempt to get Connection::%s (not a valid member)"):format(tostring(k)), 2) end,
+            __newindex = function(_, k) error(("Attempt to set Connection::%s (not a valid member)"):format(tostring(k)), 2) end,
+        })
+
+        local S = {}
+        S.__index = S
+        function S.new()
+            return setmetatable({ _handlerListHead = false, _proxyHandler = nil, _yieldedThreads = nil }, S)
+        end
+        function S.Wrap(rbx)
+            assert(typeof(rbx) == "RBXScriptSignal", "Argument #1 to Signal.Wrap must be RBXScriptSignal")
+            local s = S.new()
+            s._proxyHandler = rbx:Connect(function(...) s:Fire(...) end)
+            return s
+        end
+        function S.Is(o) return type(o) == "table" and getmetatable(o) == S end
+        function S:Connect(fn)
+            local c = setmetatable({ Connected = true, _signal = self, _fn = fn, _next = false }, Connection)
+            if self._handlerListHead then
+                c._next = self._handlerListHead
+                self._handlerListHead = c
+            else
+                self._handlerListHead = c
+            end
+            return c
+        end
+        S.ConnectOnce = function(self, fn) return self:Once(fn) end
+        function S:Once(fn)
+            local c, done
+            c = self:Connect(function(...)
+                if done then return end
+                done = true
+                c:Disconnect()
+                fn(...)
+            end)
+            return c
+        end
+        function S:GetConnections()
+            local items = {}
+            local item = self._handlerListHead
+            while item do table.insert(items, item); item = item._next end
+            return items
+        end
+        function S:DisconnectAll()
+            local item = self._handlerListHead
+            while item do item.Connected = false; item = item._next end
+            self._handlerListHead = false
+            local y = rawget(self, "_yieldedThreads")
+            if y then
+                for thread in y do
+                    if coroutine.status(thread) == "suspended" then task.cancel(thread) end
+                end
+                table.clear(y)
+            end
+        end
+        function S:Fire(...)
+            local item = self._handlerListHead
+            while item do
+                if item.Connected then
+                    if not freeRunnerThread then
+                        freeRunnerThread = coroutine.create(runner)
+                    end
+                    task.spawn(freeRunnerThread, item._fn, ...)
+                end
+                item = item._next
+            end
+        end
+        function S:FireDeferred(...)
+            local item = self._handlerListHead
+            while item do
+                local c = item
+                task.defer(function(...) if c.Connected then c._fn(...) end end, ...)
+                item = item._next
+            end
+        end
+        function S:Wait()
+            local y = rawget(self, "_yieldedThreads")
+            if not y then y = {}; rawset(self, "_yieldedThreads", y) end
+            local thread = coroutine.running()
+            y[thread] = true
+            self:Once(function(...) y[thread] = nil; task.spawn(thread, ...) end)
+            return coroutine.yield()
+        end
+        function S:Destroy()
+            self:DisconnectAll()
+            local p = rawget(self, "_proxyHandler")
+            if p then p:Disconnect() end
+        end
+        setmetatable(S, {
+            __index = function(_, k) error(("Attempt to get Signal::%s (not a valid member)"):format(tostring(k)), 2) end,
+            __newindex = function(_, k) error(("Attempt to set Signal::%s (not a valid member)"):format(tostring(k)), 2) end,
+        })
+        return table.freeze({ new = S.new, Wrap = S.Wrap, Is = S.Is })
+    end)()
+
+    -- ============================================================
+    -- Utils
+    -- ============================================================
+    local function inside(x, y, pX, pY, sX, sY)
+        return x > pX and x < pX + sX and y > pY and y < pY + sY
+    end
+    local function insideFrame(input, frame)
+        local p, s = frame.AbsolutePosition, frame.AbsoluteSize
+        return inside(input.X, input.Y, p.X, p.Y, s.X, s.Y)
+    end
+
+    -- ============================================================
+    -- UISection
+    -- ============================================================
+    local UISection = {}
+    UISection.__index = UISection
+    function UISection.new(parent, side, label)
+        local self = setmetatable({}, UISection)
+        self._trove = parent._trove:Extend()
+        self.instances = {}
+        self.parent = parent
+        self:_makeInstances(side)
+        self:setLabel(label)
+        return self
+    end
+    function UISection:setLabel(label)
+        assert(typeof(label) == "string", "UISection:setLabel -> expected string")
+        self.instances.label.Text = label
+    end
+    function UISection:_makeInstances(side)
+        local container = Instance.new("Frame")
+        container.BackgroundColor3 = Color3.fromRGB(0, 0, 0)
+        container.BorderColor3 = Color3.fromRGB(50, 50, 50)
+        container.Size = UDim2.new(1, -2, 0, 22)
+        self.instances.container = container
+
+        local inline = Instance.new("Frame")
+        inline.BackgroundColor3 = Color3.fromRGB(25, 25, 25)
+        inline.BorderSizePixel = 0
+        inline.Position = UDim2.new(0, 1, 0, 1)
+        inline.Size = UDim2.new(1, -2, 1, -2)
+        inline.Parent = container
+
+        local theme = Instance.new("Frame")
+        theme.BackgroundColor3 = Color3.fromRGB(55, 175, 225)
+        theme.BorderSizePixel = 0
+        theme.Size = UDim2.new(1, 0, 0, 2)
+        theme.Parent = inline
+
+        local label = Instance.new("TextLabel")
+        label.BackgroundTransparency = 1
+        label.Font = Enum.Font.Arial
+        label.TextSize = 12
+        label.TextStrokeTransparency = 0
+        label.TextColor3 = Color3.fromRGB(255, 255, 255)
+        label.TextXAlignment = Enum.TextXAlignment.Left
+        label.Position = UDim2.new(0, 3, 0, 5)
+        label.Size = UDim2.new(1, -6, 0, 11)
+        label.Parent = inline
+        self.instances.label = label
+
+        local canvas = Instance.new("Frame")
+        canvas.Position = UDim2.new(0, 0, 1, 0)
+        canvas.Size = UDim2.new(1, 0, 1, -20)
+        canvas.AnchorPoint = Vector2.new(0, 1)
+        canvas.BackgroundTransparency = 1
+        canvas.Parent = inline
+        self.instances.canvas = canvas
+
+        local listLayout = Instance.new("UIListLayout")
+        listLayout.Padding = UDim.new(0, 4)
+        listLayout.FillDirection = Enum.FillDirection.Vertical
+        listLayout.SortOrder = Enum.SortOrder.LayoutOrder
+        listLayout.Parent = canvas
+
+        container.Parent = self.parent.canvas[side]
+    end
+
+    -- ============================================================
+    -- UISectionHolder
+    -- ============================================================
+    local UISectionHolder = {}
+    UISectionHolder.__index = UISectionHolder
+    function UISectionHolder.new(parent)
+        local self = setmetatable({}, UISectionHolder)
+        self._trove = parent._trove:Extend()
+        self.sections = { left = {}, right = {} }
+        self.parent = parent
+        self:_makeInstances()
+        return self
+    end
+    function UISectionHolder:newSection(side, label)
+        assert(side == "left" or side == "right", "UISectionHolder:newSection -> side must be 'left' or 'right'")
+        local s = UISection.new(self, side, label)
+        table.insert(self.sections[side], s)
+        return s
+    end
+    function UISectionHolder:_makeInstances()
+        local function makeCanvas(xScale, xOffset)
+            local c = Instance.new("ScrollingFrame")
+            c.BackgroundTransparency = 1
+            c.Position = UDim2.new(xScale, xOffset, 0, 5)
+            c.AutomaticCanvasSize = Enum.AutomaticSize.Y
+            c.Size = UDim2.new(0.5, -8, 1, -10)
+            c.BorderSizePixel = 0
+            c.CanvasSize = UDim2.new(0, 0, 0, 0)
+            c.ScrollBarThickness = 1
+            c.ScrollBarImageColor3 = Color3.fromRGB(55, 175, 225)
+            local l = Instance.new("UIListLayout")
+            l.Padding = UDim.new(0, 7)
+            l.SortOrder = Enum.SortOrder.LayoutOrder
+            l.HorizontalAlignment = Enum.HorizontalAlignment.Center
+            l.Parent = c
+            local p = Instance.new("UIPadding")
+            p.PaddingTop = UDim.new(0, 1)
+            p.PaddingBottom = UDim.new(0, 1)
+            p.Parent = c
+            return c
+        end
+        local leftCanvas  = makeCanvas(0, 5)
+        local rightCanvas = makeCanvas(0.5, 3)
+        self.canvas = { left = leftCanvas, right = rightCanvas }
+        leftCanvas.Parent  = self.parent.instances.canvas
+        rightCanvas.Parent = self.parent.instances.canvas
+    end
+
+    -- ============================================================
+    -- UIExtendable (base for tabs / sections)
+    -- ============================================================
+    local UIExtendable = {}
+    UIExtendable.__index = UIExtendable
+    function UIExtendable.new()
+        return setmetatable({ instances = {}, visible = false }, UIExtendable)
+    end
+    function UIExtendable:intoSections()
+        local child = UISectionHolder.new(self)
+        self.child = child
+        return child
+    end
+
+    -- ============================================================
+    -- Colorpicker popup
+    -- ============================================================
+    local UIColorpickerMenu = {}
+    UIColorpickerMenu.__index = UIColorpickerMenu
+    function UIColorpickerMenu.new(base)
+        local self = setmetatable({}, UIColorpickerMenu)
+        self._trove = base._trove:Extend()
+        self.instances = {}
+        self.ref = base
+        self.options = {}
+        self:_makeInstances()
+        return self
+    end
+    function UIColorpickerMenu:attach(colorpicker, base)
+        if base.activeMenu ~= "none" then self:detach(base) end
+        self.feature = colorpicker
+
+        if colorpicker.hasAlpha then
+            self.instances.alphaPicker.Visible = true
+            self.instances.container.Size = UDim2.new(0, 246, 0, 260)
+        else
+            self.instances.alphaPicker.Visible = false
+            self.instances.container.Size = UDim2.new(0, 246, 0, 236)
+        end
+
+        self._trove:Connect(UserInputService.InputBegan, function(input)
+            if input.UserInputType == Enum.UserInputType.MouseButton1
+                or input.UserInputType == Enum.UserInputType.Touch then
+                local cx, cy = input.Position.X, input.Position.Y
+                local c, cs = self.instances.container.AbsolutePosition, self.instances.container.AbsoluteSize
+                if inside(cx, cy, c.X, c.Y, cs.X, cs.Y) then return end
+                local o, os = colorpicker.instances.container.AbsolutePosition, colorpicker.instances.container.AbsoluteSize
+                if not inside(cx, cy, o.X, o.Y, os.X, os.Y) then
+                    self:detach(base)
+                    colorpicker.open = false
+                end
+            end
+        end)
+
+        self._trove:Connect(colorpicker.changed, function(state)
+            local h, s, v = state.rgb:ToHSV()
+            self.instances.saturationGradient.Color = ColorSequence.new({
+                ColorSequenceKeypoint.new(0, Color3.fromRGB(0, 0, 0)),
+                ColorSequenceKeypoint.new(1, Color3.fromHSV(h, 1, 1)),
+            })
+            self.instances.huePosition.Position = UDim2.new(0.5, -4, 0, math.clamp(200 - h * 200, 0, 198))
+            self.instances.chromePosition.Position = UDim2.new(0, math.clamp(s * 200, 0, 196), 0, math.clamp(200 - v * 200, 0, 196))
+            self.instances.alphaPosition.Position = UDim2.new(0, math.clamp(state.alpha * 224, 0, 222), 0.5, -4)
+        end)
+
+        do
+            local h, s, v = colorpicker.value.rgb:ToHSV()
+            self.instances.saturationGradient.Color = ColorSequence.new({
+                ColorSequenceKeypoint.new(0, Color3.fromRGB(0, 0, 0)),
+                ColorSequenceKeypoint.new(1, Color3.fromHSV(h, 1, 1)),
+            })
+            self.instances.huePosition.Position = UDim2.new(0.5, -4, 0, math.clamp(200 - h * 200, 0, 198))
+            self.instances.chromePosition.Position = UDim2.new(0, math.clamp(s * 200, 0, 196), 0, math.clamp(200 - v * 200, 0, 196))
+            self.instances.alphaPosition.Position = UDim2.new(0, math.clamp(colorpicker.value.alpha * 224, 0, 222), 0.5, -4)
+        end
+
+        base:makeDraggable(self.instances.huePicker, self._trove, function(input)
+            local inline = self.instances.huePicker
+            local percent = 1 - math.clamp((input.Position.Y - inline.AbsolutePosition.Y) / inline.AbsoluteSize.Y, 0, 1)
+            local h, s, v = colorpicker.value.rgb:ToHSV()
+            colorpicker:set({ rgb = Color3.fromHSV(percent, s, v), alpha = colorpicker.value.alpha })
+            self.instances.huePosition.Position = UDim2.new(0.5, -4, 0, math.clamp(200 - percent * 200, 0, 198))
+        end)
+
+        base:makeDraggable(self.instances.chromePicker, self._trove, function(input)
+            local inline = self.instances.chromePicker
+            local px = math.clamp((input.Position.X - inline.AbsolutePosition.X) / inline.AbsoluteSize.X, 0, 1)
+            local py = math.clamp((input.Position.Y - inline.AbsolutePosition.Y) / inline.AbsoluteSize.Y, 0, 1)
+            local h, s, v = colorpicker.value.rgb:ToHSV()
+            colorpicker:set({ rgb = Color3.fromHSV(h, px, 1 - py), alpha = colorpicker.value.alpha })
+            self.instances.chromePosition.Position = UDim2.new(0, math.clamp(px * 200, 0, 196), 0, math.clamp(200 - (1 - py) * 200, 0, 196))
+        end)
+
+        if colorpicker.hasAlpha then
+            base:makeDraggable(self.instances.alphaPicker, self._trove, function(input)
+                local inline = self.instances.alphaPicker
+                local percent = math.clamp((input.Position.X - inline.AbsolutePosition.X) / inline.AbsoluteSize.X, 0, 1)
+                colorpicker:set({ rgb = colorpicker.value.rgb, alpha = percent })
+            end)
+        end
+
+        self.instances.container.Position = UDim2.new(
+            0, colorpicker.instances.container.AbsolutePosition.X,
+            0, colorpicker.instances.container.AbsolutePosition.Y + 74
+        )
+        self.instances.container.Parent = base.instances.gui
+        base.activeMenu = "color"
+    end
+    function UIColorpickerMenu:detach(base)
+        if not self.feature then return end
+        self.feature.open = false
+        self.feature = nil
+        base.activeMenu = "none"
+        self.instances.container.Parent = nil
+        self._trove:Clean()
+    end
+    function UIColorpickerMenu:_makeInstances()
+        local container = Instance.new("Frame")
+        container.BackgroundColor3 = Color3.fromRGB(55, 175, 225)
+        container.BorderSizePixel = 1
+        container.BorderColor3 = Color3.fromRGB(0, 0, 0)
+        container.Size = UDim2.new(0, 246, 0, 236)
+        container.ZIndex = 2
+        self.instances.container = container
+
+        local background = Instance.new("Frame")
+        background.BackgroundColor3 = Color3.fromRGB(30, 30, 30)
+        background.BorderSizePixel = 0
+        background.Position = UDim2.new(0, 1, 0, 1)
+        background.Size = UDim2.new(1, -2, 1, -2)
+        background.ZIndex = 2
+        background.Parent = container
+
+        local title = Instance.new("TextLabel")
+        title.Font = Enum.Font.Arial
+        title.Position = UDim2.new(0, 4, 0, 4)
+        title.Size = UDim2.new(1, -8, 0, 11)
+        title.ZIndex = 2
+        title.BackgroundTransparency = 1
+        title.TextColor3 = Color3.fromRGB(255, 255, 255)
+        title.TextStrokeTransparency = 0
+        title.TextSize = 12
+        title.Text = "Colorpicker"
+        title.TextXAlignment = Enum.TextXAlignment.Left
+        title.Parent = background
+
+        local canvas = Instance.new("Frame")
+        canvas.BackgroundColor3 = Color3.fromRGB(0, 0, 0)
+        canvas.BorderColor3 = Color3.fromRGB(50, 50, 50)
+        canvas.Position = UDim2.new(0, 5, 0, 19)
+        canvas.Size = UDim2.new(1, -10, 1, -24)
+        canvas.ZIndex = 2
+        canvas.Parent = background
+
+        local inline = Instance.new("Frame")
+        inline.ZIndex = 2
+        inline.BackgroundColor3 = Color3.fromRGB(25, 25, 25)
+        inline.Position = UDim2.new(0, 1, 0, 1)
+        inline.Size = UDim2.new(1, -2, 1, -2)
+        inline.BorderSizePixel = 0
+        inline.Parent = canvas
+
+        local huePicker = Instance.new("TextButton")
+        huePicker.Text = ""
+        huePicker.AutoButtonColor = false
+        huePicker.BorderSizePixel = 0
+        huePicker.Position = UDim2.new(0, 208, 0, 4)
+        huePicker.Size = UDim2.new(0, 20, 0, 200)
+        huePicker.ZIndex = 2
+        huePicker.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
+        huePicker.Parent = inline
+        self.instances.huePicker = huePicker
+
+        local hueGradient = Instance.new("UIGradient")
+        hueGradient.Rotation = 90
+        hueGradient.Color = ColorSequence.new({
+            ColorSequenceKeypoint.new(0, Color3.fromRGB(255, 0, 0)),
+            ColorSequenceKeypoint.new(0.17, Color3.fromRGB(255, 0, 255)),
+            ColorSequenceKeypoint.new(0.335, Color3.fromRGB(0, 0, 255)),
+            ColorSequenceKeypoint.new(0.5, Color3.fromRGB(0, 255, 255)),
+            ColorSequenceKeypoint.new(0.67, Color3.fromRGB(0, 255, 0)),
+            ColorSequenceKeypoint.new(0.84, Color3.fromRGB(255, 255, 0)),
+            ColorSequenceKeypoint.new(1, Color3.fromRGB(255, 0, 0)),
+        })
+        hueGradient.Parent = huePicker
+
+        local huePosition = Instance.new("Frame")
+        huePosition.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
+        huePosition.BorderColor3 = Color3.fromRGB(0, 0, 0)
+        huePosition.Position = UDim2.new(0.5, -4, 0, 0)
+        huePosition.Size = UDim2.new(0, 8, 0, 2)
+        huePosition.ZIndex = 2
+        huePosition.Parent = huePicker
+        self.instances.huePosition = huePosition
+
+        local chromePicker = Instance.new("TextButton")
+        chromePicker.Text = ""
+        chromePicker.AutoButtonColor = false
+        chromePicker.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
+        chromePicker.BorderSizePixel = 0
+        chromePicker.Position = UDim2.new(0, 4, 0, 4)
+        chromePicker.Size = UDim2.new(0, 200, 0, 200)
+        chromePicker.ZIndex = 2
+        chromePicker.Parent = inline
+        self.instances.chromePicker = chromePicker
+
+        local saturation = Instance.new("Frame")
+        saturation.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
+        saturation.BorderSizePixel = 0
+        saturation.Size = UDim2.new(1, 0, 1, 0)
+        saturation.ZIndex = 2
+        saturation.Parent = chromePicker
+
+        local saturationGradient = Instance.new("UIGradient")
+        saturationGradient.Color = ColorSequence.new({
+            ColorSequenceKeypoint.new(0, Color3.fromRGB(0, 0, 0)),
+            ColorSequenceKeypoint.new(1, Color3.fromRGB(255, 0, 0)),
+        })
+        saturationGradient.Transparency = NumberSequence.new({
+            NumberSequenceKeypoint.new(0, 1),
+            NumberSequenceKeypoint.new(1, 0),
+        })
+        saturationGradient.Parent = saturation
+        self.instances.saturationGradient = saturationGradient
+
+        local brightness = Instance.new("Frame")
+        brightness.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
+        brightness.BorderSizePixel = 0
+        brightness.Size = UDim2.new(1, 0, 1, 0)
+        brightness.ZIndex = 2
+        brightness.Parent = chromePicker
+
+        local brightnessGradient = Instance.new("UIGradient")
+        brightnessGradient.Color = ColorSequence.new(Color3.fromRGB(0, 0, 0))
+        brightnessGradient.Rotation = 90
+        brightnessGradient.Transparency = NumberSequence.new({
+            NumberSequenceKeypoint.new(0, 1),
+            NumberSequenceKeypoint.new(1, 0),
+        })
+        brightnessGradient.Parent = brightness
+
+        local chromePosition = Instance.new("Frame")
+        chromePosition.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
+        chromePosition.BorderColor3 = Color3.fromRGB(0, 0, 0)
+        chromePosition.Position = UDim2.new(0, 0, 0, 0)
+        chromePosition.Size = UDim2.new(0, 4, 0, 4)
+        chromePosition.ZIndex = 2
+        chromePosition.Parent = chromePicker
+        self.instances.chromePosition = chromePosition
+
+        local alphaPicker = Instance.new("TextButton")
+        alphaPicker.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
+        alphaPicker.BorderSizePixel = 0
+        alphaPicker.Position = UDim2.new(0, 4, 0, 208)
+        alphaPicker.Size = UDim2.new(0, 224, 0, 20)
+        alphaPicker.ZIndex = 2
+        alphaPicker.Text = ""
+        alphaPicker.AutoButtonColor = false
+        alphaPicker.Parent = inline
+        self.instances.alphaPicker = alphaPicker
+
+        local alphaGradient = Instance.new("UIGradient")
+        alphaGradient.Color = ColorSequence.new({
+            ColorSequenceKeypoint.new(0, Color3.fromRGB(0, 0, 0)),
+            ColorSequenceKeypoint.new(1, Color3.fromRGB(255, 255, 255)),
+        })
+        alphaGradient.Parent = alphaPicker
+
+        local alphaPosition = Instance.new("Frame")
+        alphaPosition.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
+        alphaPosition.BorderColor3 = Color3.fromRGB(0, 0, 0)
+        alphaPosition.Position = UDim2.new(0, 0, 0.5, -4)
+        alphaPosition.Size = UDim2.new(0, 2, 0, 8)
+        alphaPosition.ZIndex = 2
+        alphaPosition.Parent = alphaPicker
+        self.instances.alphaPosition = alphaPosition
+    end
+
+    -- ============================================================
+    -- Dropdown popup
+    -- ============================================================
+    local UIDropdownMenu = {}
+    UIDropdownMenu.__index = UIDropdownMenu
+    function UIDropdownMenu.new(base)
+        local self = setmetatable({}, UIDropdownMenu)
+        self._trove = base._trove:Extend()
+        self.instances = {}
+        self.ref = base
+        self.options = {}
+        self:_makeInstances()
+        return self
+    end
+    function UIDropdownMenu:resize()
+        assert(self.feature, "")
+        self.instances.container.Size = UDim2.new(1, 0, 0, math.min(6, #self.feature.options) * 17 + 1)
+    end
+    function UIDropdownMenu:add(option)
+        assert(self.feature, "")
+        local trove = self._trove:Extend()
+
+        local outline = Instance.new("TextButton")
+        outline.BackgroundColor3 = Color3.fromRGB(25, 25, 25)
+        outline.BorderColor3 = Color3.fromRGB(50, 50, 50)
+        outline.BorderSizePixel = 1
+        outline.Size = UDim2.new(1, 0, 0, 16)
+        outline.AutoButtonColor = false
+        outline.Text = ""
+        outline.ZIndex = 2
+
+        local label = Instance.new("TextLabel")
+        label.Font = Enum.Font.Arial
+        label.TextSize = 12
+        label.TextStrokeTransparency = 0
+        label.Position = UDim2.new(0, 4, 0, 3)
+        label.Size = UDim2.new(1, -8, 0, 11)
+        label.Text = option
+        label.BackgroundTransparency = 1
+        label.TextXAlignment = Enum.TextXAlignment.Left
+        label.ZIndex = 2
+        label.Parent = outline
+
+        local value = self.feature.value
+        if (typeof(value) == "table" and value[option]) or option == value then
+            label.TextColor3 = Color3.fromRGB(55, 175, 225)
+        else
+            label.TextColor3 = Color3.fromRGB(255, 255, 255)
+        end
+
+        outline.Parent = self.instances.layout
+
+        trove:Connect(outline.InputBegan, function(input)
+            if input.UserInputType == Enum.UserInputType.MouseButton1
+                or input.UserInputType == Enum.UserInputType.Touch then
+                local v = self.feature.value
+                if typeof(v) == "table" then
+                    v[option] = not v[option]
+                    self.feature:set(v)
+                else
+                    self.feature:set(option)
+                end
+            end
+        end)
+
+        self:resize()
+        trove:Add(outline)
+        return trove
+    end
+    function UIDropdownMenu:attach(dropdown, base)
+        if base.activeMenu ~= "none" then self:detach(base) end
+        self.feature = dropdown
+
+        for _, option in ipairs(dropdown.options) do
+            self.options[option] = self:add(option)
+        end
+
+        self._trove:Connect(dropdown.onOptionAdded, function(option)
+            self.options[option] = self:add(option)
+        end)
+
+        self._trove:Connect(dropdown.onOptionRemoved, function(option)
+            self._trove:Remove(self.options[option])
+            self.options[option] = nil
+            self:resize()
+        end)
+
+        self._trove:Connect(dropdown.changed, function(value)
+            for _, outline in self.instances.layout:GetChildren() do
+                if outline:IsA("UIListLayout") then continue end
+                local label = outline:FindFirstChildOfClass("TextLabel")
+                if label then
+                    if (typeof(value) == "table" and value[label.Text]) or label.Text == value then
+                        label.TextColor3 = Color3.fromRGB(55, 175, 225)
+                    else
+                        label.TextColor3 = Color3.fromRGB(255, 255, 255)
+                    end
+                end
+            end
+        end)
+
+        self._trove:Connect(UserInputService.InputBegan, function(input)
+            if input.UserInputType == Enum.UserInputType.MouseButton1
+                or input.UserInputType == Enum.UserInputType.Touch then
+                local cx, cy = input.Position.X, input.Position.Y
+                local c, cs = self.instances.container.AbsolutePosition, self.instances.container.AbsoluteSize
+                if inside(cx, cy, c.X, c.Y, cs.X, cs.Y) then return end
+                local o, os = dropdown.instances.outline.AbsolutePosition, dropdown.instances.outline.AbsoluteSize
+                if not inside(cx, cy, o.X, o.Y, os.X, os.Y) then
+                    self:detach(base)
+                    dropdown:setOpen(false, base)
+                end
+            end
+        end)
+
+        self:resize()
+        self.instances.container.Position = UDim2.new(
+            0, dropdown.instances.outline.AbsolutePosition.X + 1,
+            0, dropdown.instances.outline.AbsolutePosition.Y + 80
+        )
+        self.instances.container.Size = UDim2.new(
+            0, dropdown.instances.outline.AbsoluteSize.X,
+            0, self.instances.container.Size.Y.Offset
+        )
+        self.instances.container.Parent = base.instances.gui
+        base.activeMenu = "dropdown"
+    end
+    function UIDropdownMenu:detach(base)
+        assert(self.feature, "?")
+        self.feature:setOpen(false, base)
+        self.feature = nil
+        base.activeMenu = "none"
+        self.instances.container.Parent = nil
+        self._trove:Clean()
+        self.options = {}
+    end
+    function UIDropdownMenu:_makeInstances()
+        local container = Instance.new("Frame")
+        container.BackgroundColor3 = Color3.fromRGB(50, 50, 50)
+        container.BorderSizePixel = 1
+        container.BorderColor3 = Color3.fromRGB(0, 0, 0)
+        container.Position = UDim2.new(0, 0, 1, 3)
+        container.Size = UDim2.new(1, 0, 0, 0)
+        container.ZIndex = 2
+        self.instances.container = container
+
+        local layout = Instance.new("ScrollingFrame")
+        layout.BackgroundColor3 = Color3.fromRGB(15, 15, 15)
+        layout.BorderSizePixel = 0
+        layout.Position = UDim2.new(0, 1, 0, 1)
+        layout.Size = UDim2.new(1, -2, 1, -2)
+        layout.AutomaticCanvasSize = Enum.AutomaticSize.Y
+        layout.CanvasSize = UDim2.new(0, 0, 0, 0)
+        layout.ScrollBarImageColor3 = Color3.fromRGB(55, 175, 225)
+        layout.ScrollingDirection = Enum.ScrollingDirection.Y
+        layout.ScrollBarThickness = 4
+        layout.ZIndex = 2
+        layout.Parent = container
+        self.instances.layout = layout
+
+        local listLayout = Instance.new("UIListLayout")
+        listLayout.Padding = UDim.new(0, 1)
+        listLayout.Parent = layout
+    end
+
+    -- ============================================================
+    -- Colorpicker widget
+    -- ============================================================
+    local UIColorpicker = {}
+    UIColorpicker.__index = UIColorpicker
+    function UIColorpicker.new(parent, flag, base, hasAlpha)
+        assert(base.features[flag] == nil, string.format("UIBase.features[\"%s\"] already exists.", flag))
+        local self = setmetatable({}, UIColorpicker)
+        self._trove = parent._trove:Extend()
+        self.instances = {}
+        self.changed = self._trove:Add(Signal.new())
+        self.value = { rgb = Color3.new(), alpha = 0 }
+        self.hasAlpha = hasAlpha
+        self:_makeInstances(parent)
+        self:set({ rgb = Color3.fromRGB(255, 255, 255), alpha = 0 })
+
+        self._trove:Connect(self.instances.button.InputBegan, function(input)
+            if input.UserInputType == Enum.UserInputType.MouseButton1
+                or input.UserInputType == Enum.UserInputType.Touch then
+                if base.activeMenu == "dropdown" and insideFrame(input.Position, base.menus.dropdown.instances.container) then return end
+                if base.activeMenu == "color" and insideFrame(input.Position, base.menus.colorpicker.instances.container) then return end
+                self.open = not self.open
+                if self.open then
+                    base.menus.colorpicker:attach(self, base)
+                else
+                    base.menus.colorpicker:detach(base)
+                end
+            end
+        end)
+
+        base.features[flag] = self
+        return self
+    end
+    function UIColorpicker:set(value)
+        if self.value.rgb == value.rgb and self.value.alpha == value.alpha then return self end
+        local c = value.rgb
+        local top = Color3.fromRGB(math.min(255, c.R * 255 + 20), math.min(255, c.G * 255 + 20), math.min(255, c.B * 255 + 20))
+        local bot = Color3.fromRGB(math.max(0, c.R * 255 - 20), math.max(0, c.G * 255 - 20), math.max(0, c.B * 255 - 20))
+        self.instances.gradient.Color = ColorSequence.new(top, bot)
+        self.value = value
+        self.changed:Fire(self.value)
+        return self
+    end
+    function UIColorpicker:_makeInstances(parent)
+        local container = Instance.new("Frame")
+        container.BackgroundColor3 = Color3.fromRGB(50, 50, 50)
+        container.BorderSizePixel = 1
+        container.BorderColor3 = Color3.fromRGB(0, 0, 0)
+        container.Size = UDim2.new(0, 40, 1, 0)
+        self.instances.container = container
+
+        local inline = Instance.new("Frame")
+        inline.BackgroundColor3 = Color3.fromRGB(25, 25, 25)
+        inline.Position = UDim2.new(0, 1, 0, 1)
+        inline.Size = UDim2.new(1, -2, 1, -2)
+        inline.BorderSizePixel = 0
+        inline.Parent = container
+
+        local button = Instance.new("TextButton")
+        button.Size = UDim2.new(1, 0, 1, 0)
+        button.AutoButtonColor = false
+        button.BorderSizePixel = 0
+        button.TextStrokeTransparency = 0
+        button.Text = ""
+        button.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
+        button.BackgroundTransparency = 0
+        button.Parent = inline
+
+        local gradient = Instance.new("UIGradient")
+        gradient.Rotation = 90
+        gradient.Parent = button
+        self.instances.gradient = gradient
+
+        container.Parent = parent.instances.layout
+        self.instances.button = button
+    end
+
+    -- ============================================================
+    -- Toggle
+    -- ============================================================
+    local UIToggle = {}
+    UIToggle.__index = UIToggle
+    function UIToggle.new(parent, flag)
+        assert(typeof(flag) == "string", "UIToggle.new -> expected string flag")
+        local base = parent
+        while base.parent do base = base.parent end
+        assert(base.features[flag] == nil, string.format("UIBase.features[\"%s\"] already exists.", flag))
+
+        local self = setmetatable({}, UIToggle)
+        self._trove = parent._trove:Extend()
+        self.instances = {}
+        self.changed = self._trove:Add(Signal.new())
+        self.value = false
+        self.base = base
+        parent.instances.container.Size += UDim2.new(0, 0, 0, 19)
+        self:_makeInstances(parent)
+        self._trove:Connect(self.instances.button.InputBegan, function(input)
+            if input.UserInputType == Enum.UserInputType.MouseButton1
+                or input.UserInputType == Enum.UserInputType.Touch then
+                if base.activeMenu == "dropdown" and insideFrame(input.Position, base.menus.dropdown.instances.container) then return end
+                if base.activeMenu == "color" and insideFrame(input.Position, base.menus.colorpicker.instances.container) then return end
+                self:set(not self.value)
+            end
+        end)
+        base.features[flag] = self
+        return self
+    end
+    function UIToggle:set(state)
+        if typeof(state) ~= "boolean" then return self end
+        if self.value == state then return self end
+        self.value = state
+        if state then
+            self.instances.gradient.Color = ColorSequence.new(Color3.fromRGB(60, 180, 230), Color3.fromRGB(10, 130, 180))
+        else
+            self.instances.gradient.Color = ColorSequence.new(Color3.fromRGB(30, 30, 30), Color3.fromRGB(25, 25, 25))
+        end
+        self.changed:Fire(self.value)
+        return self
+    end
+    function UIToggle:setLabel(label)
+        assert(typeof(label) == "string", "UIToggle:setLabel -> expected string")
+        self.instances.label.Text = label
+        return self
+    end
+    function UIToggle:newKeybind(flag, modes)
+        return UIKeybind.new(self, flag, modes or { "Always", "Toggle", "Hold", "Release" }, self.base)
+    end
+    function UIToggle:newColorpicker(flag, hasAlpha)
+        return UIColorpicker.new(self, flag, self.base, hasAlpha or false)
+    end
+    function UIToggle:_makeInstances(parent)
+        local button = Instance.new("TextButton")
+        button.BackgroundTransparency = 1
+        button.Size = UDim2.new(1, 0, 0, 15)
+        button.Text = ""
+
+        local outline = Instance.new("Frame")
+        outline.BorderColor3 = Color3.fromRGB(0, 0, 0)
+        outline.BackgroundColor3 = Color3.fromRGB(50, 50, 50)
+        outline.Size = UDim2.new(0, 13, 0, 13)
+        outline.Position = UDim2.new(0, 5, 0.5, 0)
+        outline.AnchorPoint = Vector2.new(0, 0.5)
+        outline.Parent = button
+
+        local inline = Instance.new("Frame")
+        inline.BorderSizePixel = 0
+        inline.Size = UDim2.new(1, -2, 1, -2)
+        inline.Position = UDim2.new(0, 1, 0, 1)
+        inline.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
+        inline.Parent = outline
+
+        local gradient = Instance.new("UIGradient")
+        gradient.Color = ColorSequence.new(Color3.fromRGB(30, 30, 30), Color3.fromRGB(25, 25, 25))
+        gradient.Rotation = 90
+        gradient.Parent = inline
+        self.instances.gradient = gradient
+
+        local label = Instance.new("TextLabel")
+        label.Font = Enum.Font.Arial
+        label.TextSize = 12
+        label.TextStrokeTransparency = 0
+        label.Position = UDim2.new(0, 23, 0.5, 0)
+        label.Size = UDim2.new(1, -27, 0, 11)
+        label.AnchorPoint = Vector2.new(0, 0.5)
+        label.Text = ""
+        label.BackgroundTransparency = 1
+        label.TextColor3 = Color3.fromRGB(255, 255, 255)
+        label.TextXAlignment = Enum.TextXAlignment.Left
+        label.Parent = button
+        self.instances.label = label
+
+        local layout = Instance.new("Frame")
+        layout.Size = UDim2.new(1, -10, 0, 13)
+        layout.Position = UDim2.new(0, 5, 0, 1)
+        layout.BackgroundTransparency = 1
+        layout.Parent = button
+        self.instances.layout = layout
+
+        local listLayout = Instance.new("UIListLayout")
+        listLayout.Padding = UDim.new(0, 4)
+        listLayout.FillDirection = Enum.FillDirection.Horizontal
+        listLayout.HorizontalAlignment = Enum.HorizontalAlignment.Right
+        listLayout.SortOrder = Enum.SortOrder.LayoutOrder
+        listLayout.Parent = layout
+
+        button.Parent = parent.instances.canvas
+        self.instances.button = button
+    end
+
+    -- ============================================================
+    -- Slider
+    -- ============================================================
+    local UISlider = {}
+    UISlider.__index = UISlider
+    function UISlider.new(parent, flag, min, max, decimals)
+        assert(typeof(flag) == "string", "UISlider.new -> expected string flag")
+        local base = parent
+        while base.parent do base = base.parent end
+        assert(base.features[flag] == nil, string.format("UIBase.features[\"%s\"] already exists.", flag))
+
+        local self = setmetatable({}, UISlider)
+        self._trove = parent._trove:Extend()
+        self.min = min or 0
+        self.max = max or 100
+        self.decimals = decimals or 1
+        self.instances = {}
+        self.changed = self._trove:Add(Signal.new())
+        self.value = nil
+        parent.instances.container.Size += UDim2.new(0, 0, 0, 30)
+        self:_makeInstances(parent)
+        self:set((self.min + self.max) / 2)
+        self:_bind(base)
+        base.features[flag] = self
+        return self
+    end
+    function UISlider:set(value)
+        if typeof(value) ~= "number" then return self end
+        value = math.clamp(math.round(value * self.decimals) / self.decimals, self.min, self.max)
+        local equal = self.value == value
+        self.value = value
+        self.instances.scale.Size = UDim2.new((value - self.min) / (self.max - self.min), 0, 1, 0)
+        self.instances.value.Text = string.format("%s/%s", tostring(value), tostring(self.max))
+        if not equal then self.changed:Fire(value) end
+        return self
+    end
+    function UISlider:setLabel(label)
+        assert(typeof(label) == "string", "UISlider:setLabel -> expected string")
+        self.instances.label.Text = label
+        return self
+    end
+    function UISlider:_makeInstances(parent)
+        local container = Instance.new("Frame")
+        container.BackgroundTransparency = 1
+        container.Size = UDim2.new(1, 0, 0, 26)
+
+        local label = Instance.new("TextLabel")
+        label.Font = Enum.Font.Arial
+        label.TextSize = 12
+        label.TextStrokeTransparency = 0
+        label.Position = UDim2.new(0, 5, 0, 1)
+        label.Size = UDim2.new(1, -6, 0, 11)
+        label.Text = ""
+        label.BackgroundTransparency = 1
+        label.TextColor3 = Color3.fromRGB(255, 255, 255)
+        label.TextXAlignment = Enum.TextXAlignment.Left
+        label.Parent = container
+        self.instances.label = label
+
+        local outline = Instance.new("TextButton")
+        outline.BackgroundColor3 = Color3.fromRGB(50, 50, 50)
+        outline.BorderSizePixel = 1
+        outline.BorderColor3 = Color3.fromRGB(0, 0, 0)
+        outline.Size = UDim2.new(1, -10, 0, 10)
+        outline.Position = UDim2.new(0, 5, 0, 15)
+        outline.Text = ""
+        outline.AutoButtonColor = false
+        outline.Parent = container
+        self.instances.outline = outline
+
+        local inline = Instance.new("Frame")
+        inline.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
+        inline.BorderSizePixel = 0
+        inline.Size = UDim2.new(1, -2, 1, -2)
+        inline.Position = UDim2.new(0, 1, 0, 1)
+        inline.Parent = outline
+        self.instances.inline = inline
+
+        local gradient = Instance.new("UIGradient")
+        gradient.Color = ColorSequence.new(Color3.fromRGB(30, 30, 30), Color3.fromRGB(25, 25, 25))
+        gradient.Rotation = 90
+        gradient.Parent = inline
+
+        local scale = Instance.new("Frame")
+        scale.BorderSizePixel = 0
+        scale.Size = UDim2.new(0.5, 0, 1, 0)
+        scale.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
+        scale.Parent = inline
+        self.instances.scale = scale
+
+        local gradient2 = Instance.new("UIGradient")
+        gradient2.Color = ColorSequence.new(Color3.fromRGB(60, 180, 230), Color3.fromRGB(10, 130, 180))
+        gradient2.Rotation = 90
+        gradient2.Parent = scale
+
+        local plus = Instance.new("TextButton")
+        plus.Text = "+"
+        plus.BackgroundTransparency = 1
+        plus.Size = UDim2.new(0, 11, 0, 11)
+        plus.Font = Enum.Font.Arial
+        plus.TextSize = 12
+        plus.Position = UDim2.new(1, -13, 0, 0)
+        plus.TextStrokeTransparency = 0
+        plus.TextColor3 = Color3.fromRGB(255, 255, 255)
+        plus.Parent = container
+        self.instances.plus = plus
+
+        local minus = Instance.new("TextButton")
+        minus.Text = "-"
+        minus.BackgroundTransparency = 1
+        minus.Size = UDim2.new(0, 11, 0, 11)
+        minus.Font = Enum.Font.Arial
+        minus.TextSize = 12
+        minus.Position = UDim2.new(1, -26, 0, 0)
+        minus.TextStrokeTransparency = 0
+        minus.TextColor3 = Color3.fromRGB(255, 255, 255)
+        minus.Parent = container
+        self.instances.minus = minus
+
+        local value = Instance.new("TextLabel")
+        value.Font = Enum.Font.Arial
+        value.TextSize = 12
+        value.TextStrokeTransparency = 0
+        value.Position = UDim2.new(0, 0, 0, 0)
+        value.Size = UDim2.new(1, 0, 1, 0)
+        value.Text = "undefined"
+        value.BackgroundTransparency = 1
+        value.TextColor3 = Color3.fromRGB(255, 255, 255)
+        value.TextXAlignment = Enum.TextXAlignment.Center
+        value.Parent = inline
+        self.instances.value = value
+
+        container.Parent = parent.instances.canvas
+    end
+    function UISlider:_bind(base)
+        local dragInput, dragging = nil, false
+        local onMove = function(input)
+            if dragging and input == dragInput then
+                local inline = self.instances.inline
+                local percent = math.clamp((input.Position.X - inline.AbsolutePosition.X) / inline.AbsoluteSize.X, 0, 1)
+                self:set(self.min + (self.max - self.min) * percent)
+            end
+        end
+        local conn = self._trove:Connect(UserInputService.InputChanged, onMove)
+        self._trove:Connect(base.visibilityChanged, function(state)
+            if not state then
+                dragging = false
+                self._trove:Remove(conn)
+                return
+            end
+            conn = self._trove:Connect(UserInputService.InputChanged, onMove)
+        end)
+        self._trove:Connect(self.instances.outline.InputBegan, function(input)
+            if input.UserInputType == Enum.UserInputType.MouseButton1
+                or input.UserInputType == Enum.UserInputType.Touch then
+                if base.activeMenu == "dropdown" and insideFrame(input.Position, base.menus.dropdown.instances.container) then return end
+                if base.activeMenu == "color" and insideFrame(input.Position, base.menus.colorpicker.instances.container) then return end
+                dragging = true
+                dragInput = input
+                onMove(input)
+                local onChanged
+                onChanged = self._trove:Connect(input.Changed, function()
+                    if input.UserInputState == Enum.UserInputState.End then
+                        dragging = false
+                        self._trove:Remove(onChanged)
+                        dragInput = nil
+                    end
+                end)
+            end
+        end)
+        self._trove:Connect(self.instances.outline.InputChanged, function(input)
+            if input.UserInputType == Enum.UserInputType.MouseMovement
+                or input.UserInputType == Enum.UserInputType.Touch then
+                dragInput = input
+            end
+        end)
+        self._trove:Connect(self.instances.plus.InputBegan, function(input)
+            if input.UserInputType == Enum.UserInputType.MouseButton1
+                or input.UserInputType == Enum.UserInputType.Touch then
+                self:set(self.value + 1 / self.decimals)
+            end
+        end)
+        self._trove:Connect(self.instances.minus.InputBegan, function(input)
+            if input.UserInputType == Enum.UserInputType.MouseButton1
+                or input.UserInputType == Enum.UserInputType.Touch then
+                self:set(self.value - 1 / self.decimals)
+            end
+        end)
+    end
+
+    -- ============================================================
+    -- Keybind
+    -- ============================================================
+    local UIKeybind = {}
+    UIKeybind.__index = UIKeybind
+    function UIKeybind.new(parent, flag, modes, base)
+        assert(base.features[flag] == nil, string.format("UIBase.features[\"%s\"] already exists.", flag))
+        local self = setmetatable({}, UIKeybind)
+        self._trove = parent._trove:Extend()
+        self.instances = {}
+        self.changed = self._trove:Add(Signal.new())
+        self.value = {}
+        self.binding = false
+        self.active = false
+        self.activeChanged = self._trove:Add(Signal.new())
+        self.modes = modes
+        self:_makeInstances(parent)
+        self:set({ key = nil, mode = self.modes[1] })
+        self:_bind(base)
+        base.features[flag] = self
+        return self
+    end
+    function UIKeybind:set(value)
+        if self.value.key == value.key and self.value.mode == value.mode and not self.binding then return self end
+        if value.key == Enum.UserInputType.MouseMovement then return self end
+        self.instances.button.Text = string.format("%s: %s", value.mode, value.key and value.key.Name or "None")
+        self.value = value
+        self.changed:Fire(self.value)
+        return self
+    end
+    function UIKeybind:_setActive(state)
+        if self.active == state then return end
+        self.active = state
+        self.activeChanged:Fire(self.active)
+    end
+    function UIKeybind:isInputKey(input)
+        local key = self.value.key
+        if not key then return false end
+        if key.EnumType == Enum.KeyCode and input.KeyCode ~= key then return false end
+        if key.EnumType == Enum.UserInputType and input.UserInputType ~= key then return false end
+        return true
+    end
+    function UIKeybind:_makeInstances(parent)
+        local container = Instance.new("Frame")
+        container.BackgroundColor3 = Color3.fromRGB(50, 50, 50)
+        container.BorderSizePixel = 1
+        container.BorderColor3 = Color3.fromRGB(0, 0, 0)
+        container.Size = UDim2.new(0, 0, 1, 0)
+        self.instances.container = container
+
+        local inline = Instance.new("Frame")
+        inline.BackgroundColor3 = Color3.fromRGB(25, 25, 25)
+        inline.Position = UDim2.new(0, 1, 0, 1)
+        inline.Size = UDim2.new(1, -2, 1, -2)
+        inline.BorderSizePixel = 0
+        inline.Parent = container
+
+        local button = Instance.new("TextButton")
+        button.Size = UDim2.new(1, 0, 1, 0)
+        button.TextColor3 = Color3.fromRGB(255, 255, 255)
+        button.TextStrokeTransparency = 0
+        button.TextXAlignment = Enum.TextXAlignment.Center
+        button.Font = Enum.Font.Arial
+        button.TextSize = 12
+        button.BackgroundTransparency = 1
+        button.Parent = inline
+        self.instances.button = button
+
+        container.Parent = parent.instances.layout
+    end
+    function UIKeybind:_bind(base)
+        self._trove:Connect(self.instances.button:GetPropertyChangedSignal("TextBounds"), function()
+            self.instances.container.Size = UDim2.new(0, self.instances.button.TextBounds.X + 8, 1, 0)
+        end)
+        self._trove:Connect(self.changed, function(state)
+            self:_setActive(state.mode == "Always")
+        end)
+        local disable_keybind = false
+        self._trove:Connect(UserInputService.InputBegan, function(input)
+            if not self:isInputKey(input) then return end
+            if disable_keybind then disable_keybind = false; return end
+            local mode = self.value.mode
+            if mode == "Toggle" or mode == "Tap" then
+                self:_setActive(not self.active)
+            elseif mode == "Hold" or mode == "Release" then
+                self:_setActive(mode == "Hold")
+            end
+        end)
+        self._trove:Connect(UserInputService.InputEnded, function(input)
+            if not self:isInputKey(input) then return end
+            local mode = self.value.mode
+            if mode == "Hold" or mode == "Release" then
+                self:_setActive(mode == "Release")
+            end
+        end)
+        self._trove:Connect(self.instances.button.InputBegan, function(input)
+            if base.activeMenu == "dropdown" and insideFrame(input.Position, base.menus.dropdown.instances.container) then return end
+            if base.activeMenu == "color" and insideFrame(input.Position, base.menus.colorpicker.instances.container) then return end
+            if base.binding then return end
+            if input.UserInputType == Enum.UserInputType.MouseButton1 then
+                base.binding = self
+                self.binding = true
+                self.instances.button.Text = "..."
+                local debounce = true
+                local connection
+                connection = self._trove:Connect(UserInputService.InputBegan, function(input2)
+                    if debounce then debounce = false; return end
+                    if input2.UserInputType == Enum.UserInputType.MouseMovement then return end
+                    local key
+                    if input2.KeyCode ~= Enum.KeyCode.Backspace then
+                        if input2.KeyCode ~= Enum.KeyCode.Unknown then
+                            key = input2.KeyCode
+                        else
+                            key = input2.UserInputType
+                        end
+                    end
+                    disable_keybind = true
+                    self:set({ key = key, mode = self.value.mode })
+                    self.binding = false
+                    base.binding = nil
+                    self._trove:Remove(connection)
+                end)
+            elseif input.UserInputType == Enum.UserInputType.MouseButton2 then
+                local index = table.find(self.modes, self.value.mode)
+                self:set({ key = self.value.key, mode = self.modes[(index % #self.modes) + 1] })
+            end
+        end)
+    end
+
+    -- ============================================================
+    -- Dropdown widget
+    -- ============================================================
+    local UIDropdown = {}
+    UIDropdown.__index = UIDropdown
+    function UIDropdown.new(parent, flag, multi, options)
+        assert(typeof(flag) == "string", "UIDropdown.new -> expected string flag")
+        assert(typeof(options) == "table", "UIDropdown.new -> options must be table")
+        local base = parent
+        while base.parent do base = base.parent end
+        assert(base.features[flag] == nil, string.format("UIBase.features[\"%s\"] already exists.", flag))
+
+        local self = setmetatable({}, UIDropdown)
+        self._trove = parent._trove:Extend()
+        self.base = base
+        self.instances = {}
+        self.changed = self._trove:Add(Signal.new())
+        self.value = nil
+        self.onOptionAdded = self._trove:Add(Signal.new())
+        self.onOptionRemoved = self._trove:Add(Signal.new())
+        self.open = false
+        self.options = options
+        self.multi = multi
+        parent.instances.container.Size += UDim2.new(0, 0, 0, 24)
+        self:_makeInstances(parent)
+        if not self.multi then
+            self:set(options[1])
+        else
+            self:set({})
+        end
+        self._trove:Connect(self.instances.outline.InputBegan, function(input)
+            if input.UserInputType == Enum.UserInputType.MouseButton1
+                or input.UserInputType == Enum.UserInputType.Touch then
+                if base.activeMenu == "dropdown" and insideFrame(input.Position, base.menus.dropdown.instances.container) then return end
+                if base.activeMenu == "color" and insideFrame(input.Position, base.menus.colorpicker.instances.container) then return end
+                self:setOpen(not self.open, base)
+                if self.open then
+                    base.menus.dropdown:attach(self, base)
+                else
+                    base.menus.dropdown:detach(base)
+                end
+            end
+        end)
+        base.features[flag] = self
+        return self
+    end
+    function UIDropdown:add(option)
+        if not table.find(self.options, option) then
+            table.insert(self.options, option)
+            self.onOptionAdded:Fire(option)
+        end
+    end
+    function UIDropdown:remove(option)
+        local index = table.find(self.options, option)
+        if index then
+            table.remove(self.options, index)
+            self.onOptionRemoved:Fire(option)
+            local value = self.value
+            if typeof(value) == "table" then
+                if value[option] then
+                    value[option] = nil
+                    self:set(value)
+                end
+            else
+                if self.value == option then
+                    self:set(self.options[1])
+                end
+            end
+        end
+    end
+    function UIDropdown:setOpen(state)
+        if self.open == state then return end
+        self.open = state
+        self.instances.open.Text = state and "-" or "+"
+    end
+    function UIDropdown:set(value)
+        if self.value == value and not self.multi then return end
+        self.value = value
+        if typeof(value) == "table" then
+            local res = ""
+            for _, option in ipairs(self.options) do
+                if value[option] then res ..= option .. ", " end
+            end
+            self.instances.value.Text = (#res == 0) and "..." or string.sub(res, 1, #res - 2)
+        else
+            self.instances.value.Text = value or "None"
+        end
+        self.changed:Fire(self.value)
+    end
+    function UIDropdown:_makeInstances(parent)
+        local container = Instance.new("Frame")
+        container.Size = UDim2.new(1, 0, 0, 20)
+        container.BackgroundTransparency = 1
+
+        local outline = Instance.new("TextButton")
+        outline.BackgroundColor3 = Color3.fromRGB(50, 50, 50)
+        outline.BorderSizePixel = 1
+        outline.BorderColor3 = Color3.fromRGB(0, 0, 0)
+        outline.Position = UDim2.new(0, 5, 0, 0)
+        outline.Size = UDim2.new(1, -10, 0, 18)
+        outline.AutoButtonColor = false
+        outline.Text = ""
+        outline.Parent = container
+        self.instances.outline = outline
+
+        local inline = Instance.new("Frame")
+        inline.Position = UDim2.new(0, 1, 0, 1)
+        inline.Size = UDim2.new(1, -2, 1, -2)
+        inline.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
+        inline.BorderSizePixel = 0
+        inline.Parent = outline
+
+        local gradient = Instance.new("UIGradient")
+        gradient.Color = ColorSequence.new(Color3.fromRGB(30, 30, 30), Color3.fromRGB(25, 25, 25))
+        gradient.Rotation = 90
+        gradient.Parent = inline
+
+        local value = Instance.new("TextLabel")
+        value.Font = Enum.Font.Arial
+        value.TextSize = 12
+        value.TextStrokeTransparency = 0
+        value.Position = UDim2.new(0, 4, 0.5, 0)
+        value.Size = UDim2.new(1, -18, 0, 11)
+        value.AnchorPoint = Vector2.new(0, 0.5)
+        value.Text = "None"
+        value.BackgroundTransparency = 1
+        value.TextColor3 = Color3.fromRGB(255, 255, 255)
+        value.TextXAlignment = Enum.TextXAlignment.Left
+        value.TextTruncate = Enum.TextTruncate.AtEnd
+        value.Parent = inline
+        self.instances.value = value
+
+        local open = Instance.new("TextLabel")
+        open.Font = Enum.Font.Arial
+        open.TextSize = 12
+        open.TextStrokeTransparency = 0
+        open.Position = UDim2.new(0, 5, 0.5, -1)
+        open.Size = UDim2.new(1, -8, 0, 11)
+        open.AnchorPoint = Vector2.new(0, 0.5)
+        open.Text = "+"
+        open.BackgroundTransparency = 1
+        open.TextColor3 = Color3.fromRGB(255, 255, 255)
+        open.TextXAlignment = Enum.TextXAlignment.Right
+        open.Parent = inline
+        self.instances.open = open
+
+        container.Parent = parent.instances.canvas
+    end
+
+    -- ============================================================
+    -- TextBox
+    -- ============================================================
+    local UITextBox = {}
+    UITextBox.__index = UITextBox
+    function UITextBox.new(parent, flag)
+        assert(typeof(flag) == "string", "UITextBox.new -> expected string flag")
+        local base = parent
+        while base.parent do base = base.parent end
+        assert(base.features[flag] == nil, string.format("UIBase.features[\"%s\"] already exists.", flag))
+
+        local self = setmetatable({}, UITextBox)
+        self._trove = parent._trove:Extend()
+        self.instances = {}
+        self.changed = self._trove:Add(Signal.new())
+        parent.instances.container.Size += UDim2.new(0, 0, 0, 24)
+        self:_makeInstances(parent)
+        self:set("")
+        self._trove:Connect(self.instances.textbox:GetPropertyChangedSignal("Text"), function()
+            self.instances.textbox.TextXAlignment = Enum.TextXAlignment.Center
+            self:set(self.instances.textbox.Text)
+        end)
+        base.features[flag] = self
+        return self
+    end
+    function UITextBox:set(text)
+        local textbox = self.instances.textbox
+        local t = string.sub(text, 1, 20)
+        if self.value == t then
+            textbox.Text = t
+            return self
+        end
+        textbox.Text = t
+        self.value = t
+        self.changed:Fire(self.value)
+        return self
+    end
+    function UITextBox:setLabel(label)
+        assert(typeof(label) == "string", "UITextBox:setLabel -> expected string")
+        self.instances.textbox.PlaceholderText = label
+        return self
+    end
+    function UITextBox:_makeInstances(parent)
+        local container = Instance.new("Frame")
+        container.Size = UDim2.new(1, 0, 0, 20)
+        container.BackgroundTransparency = 1
+
+        local outline = Instance.new("Frame")
+        outline.BackgroundColor3 = Color3.fromRGB(50, 50, 50)
+        outline.BorderSizePixel = 1
+        outline.BorderColor3 = Color3.fromRGB(0, 0, 0)
+        outline.Position = UDim2.new(0, 5, 0, 0)
+        outline.Size = UDim2.new(1, -10, 0, 18)
+        outline.Parent = container
+
+        local inline = Instance.new("Frame")
+        inline.Position = UDim2.new(0, 1, 0, 1)
+        inline.Size = UDim2.new(1, -2, 1, -2)
+        inline.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
+        inline.BorderSizePixel = 0
+        inline.Parent = outline
+
+        local gradient = Instance.new("UIGradient")
+        gradient.Color = ColorSequence.new(Color3.fromRGB(30, 30, 30), Color3.fromRGB(25, 25, 25))
+        gradient.Rotation = 90
+        gradient.Parent = inline
+
+        local textbox = Instance.new("TextBox")
+        textbox.Font = Enum.Font.Arial
+        textbox.TextSize = 12
+        textbox.TextStrokeTransparency = 0
+        textbox.Position = UDim2.new(0, 0, 0, 0)
+        textbox.Size = UDim2.new(1, 0, 1, 0)
+        textbox.BackgroundTransparency = 1
+        textbox.TextColor3 = Color3.fromRGB(255, 255, 255)
+        textbox.TextXAlignment = Enum.TextXAlignment.Center
+        textbox.Text = ""
+        textbox.ClearTextOnFocus = false
+        textbox.Parent = inline
+        self.instances.textbox = textbox
+
+        container.Parent = parent.instances.canvas
+    end
+
+    -- ============================================================
+    -- Label
+    -- ============================================================
+    local UILabel = {}
+    UILabel.__index = UILabel
+    function UILabel.new(parent, flag)
+        assert(typeof(flag) == "string", "UILabel.new -> expected string flag")
+        local base = parent
+        while base.parent do base = base.parent end
+        assert(base.features[flag] == nil, string.format("UIBase.features[\"%s\"] already exists.", flag))
+
+        local self = setmetatable({}, UILabel)
+        self._trove = parent._trove:Extend()
+        self.instances = {}
+        self.changed = self._trove:Add(Signal.new())
+        self.value = false
+        self.base = base
+        parent.instances.container.Size += UDim2.new(0, 0, 0, 19)
+        self:_makeInstances(parent)
+        base.features[flag] = self
+        return self
+    end
+    function UILabel:set() return self end
+    function UILabel:setLabel(label)
+        assert(typeof(label) == "string", "UILabel:setLabel -> expected string")
+        self.instances.label.Text = label
+        return self
+    end
+    function UILabel:newKeybind(flag, modes)
+        return UIKeybind.new(self, flag, modes or { "Always", "Toggle", "Hold", "Release" }, self.base)
+    end
+    function UILabel:newColorpicker(flag, hasAlpha)
+        return UIColorpicker.new(self, flag, self.base, hasAlpha or false)
+    end
+    function UILabel:_makeInstances(parent)
+        local container = Instance.new("Frame")
+        container.Size = UDim2.new(1, 0, 0, 15)
+        container.BackgroundTransparency = 1
+
+        local label = Instance.new("TextLabel")
+        label.Font = Enum.Font.Arial
+        label.TextSize = 12
+        label.TextStrokeTransparency = 0
+        label.Position = UDim2.new(0, 5, 0.5, 0)
+        label.AnchorPoint = Vector2.new(0, 0.5)
+        label.Size = UDim2.new(1, -10, 0, 11)
+        label.Text = ""
+        label.BackgroundTransparency = 1
+        label.TextColor3 = Color3.fromRGB(255, 255, 255)
+        label.TextXAlignment = Enum.TextXAlignment.Left
+        label.Parent = container
+        self.instances.label = label
+
+        local layout = Instance.new("Frame")
+        layout.Size = UDim2.new(1, -10, 0, 13)
+        layout.Position = UDim2.new(0, 5, 0, 1)
+        layout.BackgroundTransparency = 1
+        layout.Parent = container
+        self.instances.layout = layout
+
+        local listLayout = Instance.new("UIListLayout")
+        listLayout.Padding = UDim.new(0, 4)
+        listLayout.FillDirection = Enum.FillDirection.Horizontal
+        listLayout.HorizontalAlignment = Enum.HorizontalAlignment.Right
+        listLayout.SortOrder = Enum.SortOrder.LayoutOrder
+        listLayout.Parent = layout
+
+        container.Parent = parent.instances.canvas
+    end
+
+    -- ============================================================
+    -- Button
+    -- ============================================================
+    local UIButton = {}
+    UIButton.__index = UIButton
+    function UIButton.new(parent, flag)
+        assert(typeof(flag) == "string", "UIButton.new -> expected string flag")
+        local base = parent
+        while base.parent do base = base.parent end
+        assert(base.features[flag] == nil, string.format("UIBase.features[\"%s\"] already exists.", flag))
+
+        local self = setmetatable({}, UIButton)
+        self._trove = parent._trove:Extend()
+        self.instances = {}
+        self.changed = self._trove:Add(Signal.new())
+        parent.instances.container.Size += UDim2.new(0, 0, 0, 24)
+        self:_makeInstances(parent)
+        self._trove:Connect(self.instances.button.InputBegan, function(input)
+            if input.UserInputType == Enum.UserInputType.MouseButton1
+                or input.UserInputType == Enum.UserInputType.Touch then
+                if base.activeMenu == "dropdown" and insideFrame(input.Position, base.menus.dropdown.instances.container) then return end
+                if base.activeMenu == "color" and insideFrame(input.Position, base.menus.colorpicker.instances.container) then return end
+                self.changed:Fire()
+                self.instances.button.TextColor3 = Color3.fromRGB(55, 175, 225)
+            end
+        end)
+        self._trove:Connect(self.instances.button.InputEnded, function(input)
+            if input.UserInputType == Enum.UserInputType.MouseButton1
+                or input.UserInputType == Enum.UserInputType.Touch then
+                self.instances.button.TextColor3 = Color3.fromRGB(255, 255, 255)
+            end
+        end)
+        base.features[flag] = self
+        return self
+    end
+    function UIButton:set() return self end
+    function UIButton:setLabel(label)
+        assert(typeof(label) == "string", "UIButton:setLabel -> expected string")
+        self.instances.button.Text = label
+        return self
+    end
+    function UIButton:_makeInstances(parent)
+        local container = Instance.new("Frame")
+        container.Size = UDim2.new(1, 0, 0, 20)
+        container.BackgroundTransparency = 1
+
+        local outline = Instance.new("Frame")
+        outline.BackgroundColor3 = Color3.fromRGB(50, 50, 50)
+        outline.BorderSizePixel = 1
+        outline.BorderColor3 = Color3.fromRGB(0, 0, 0)
+        outline.Position = UDim2.new(0, 5, 0, 0)
+        outline.Size = UDim2.new(1, -10, 0, 18)
+        outline.Parent = container
+
+        local inline = Instance.new("Frame")
+        inline.Position = UDim2.new(0, 1, 0, 1)
+        inline.Size = UDim2.new(1, -2, 1, -2)
+        inline.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
+        inline.BorderSizePixel = 0
+        inline.Parent = outline
+
+        local gradient = Instance.new("UIGradient")
+        gradient.Color = ColorSequence.new(Color3.fromRGB(30, 30, 30), Color3.fromRGB(25, 25, 25))
+        gradient.Rotation = 90
+        gradient.Parent = inline
+
+        local button = Instance.new("TextButton")
+        button.Font = Enum.Font.Arial
+        button.TextSize = 12
+        button.TextStrokeTransparency = 0
+        button.Position = UDim2.new(0, 0, 0, 0)
+        button.Size = UDim2.new(1, 0, 1, 0)
+        button.BackgroundTransparency = 1
+        button.TextColor3 = Color3.fromRGB(255, 255, 255)
+        button.TextXAlignment = Enum.TextXAlignment.Center
+        button.Text = ""
+        button.Parent = inline
+        self.instances.button = button
+
+        container.Parent = parent.instances.canvas
+    end
+
+    -- ============================================================
+    -- TabList
+    -- ============================================================
+    local UITabList = {}
+    UITabList.__index = UITabList
+    function UITabList.new(parent)
+        assert(parent, "UITabList.new(parent) -> expected UIExtendable")
+        local self = setmetatable({}, UITabList)
+        self._trove = parent._trove:Extend()
+        self.instances = {}
+        self.children = {}
+        self.parent = parent
+        self:_makeInstances()
+        return self
+    end
+    function UITabList:newTab(label)
+        assert(typeof(label) == "string", "UITabList:newTab -> expected string")
+        local tab = UIExtendable.new()
+        tab._trove = self._trove:Extend()
+        tab.setVisible = UITabList.setVisible
+        tab.parent = self
+        table.insert(self.children, tab)
+        self:_makeTabInstances(tab)
+        tab.instances.button.Text = label
+        if #self.children == 1 then tab:setVisible(true) end
+        self._trove:Connect(tab.instances.button.InputBegan, function(input)
+            if input.UserInputType == Enum.UserInputType.MouseButton1
+                or input.UserInputType == Enum.UserInputType.Touch then
+                tab:setVisible(true)
+            end
+        end)
+        self:_resize()
+        return tab
+    end
+    function UITabList:setVisible(state)
+        return UITabList.setTabVisible(self, state)
+    end
+    function UITabList:setTabVisible(state)
+        assert(typeof(state) == "boolean", "UITabList:setVisible -> expected boolean")
+        if self.visible == state then return end
+        self.visible = state
+        assert(self.parent, "UITabList:setTabVisible -> internal failure")
+        for _, tab in self.parent.children do
+            local i = tab.instances
+            i.inline.BackgroundColor3 = Color3.fromRGB(25, 25, 25)
+            i.cover.BackgroundColor3 = Color3.fromRGB(25, 25, 25)
+            i.cover.Size = UDim2.new(1, 0, 0, 1)
+            i.canvas.Visible = false
+            tab.visible = false
+        end
+        local i = self.instances
+        i.inline.BackgroundColor3 = Color3.fromRGB(30, 30, 30)
+        i.cover.BackgroundColor3 = Color3.fromRGB(30, 30, 30)
+        i.cover.Size = UDim2.new(1, 0, 0, 2)
+        i.canvas.Visible = true
+    end
+    function UITabList:_makeTabInstances(tab)
+        local outline = Instance.new("Frame")
+        outline.BackgroundColor3 = Color3.fromRGB(0, 0, 0)
+        outline.BorderSizePixel = 0
+        outline.Size = UDim2.new(0, 0, 1, 0)
+        tab.instances.outline = outline
+
+        local inline = Instance.new("Frame")
+        inline.BackgroundColor3 = Color3.fromRGB(25, 25, 25)
+        inline.BorderColor3 = Color3.fromRGB(50, 50, 50)
+        inline.Position = UDim2.new(0, 2, 0, 2)
+        inline.Size = UDim2.new(1, -4, 1, -3)
+        inline.Parent = outline
+        tab.instances.inline = inline
+
+        local cover = Instance.new("Frame")
+        cover.BorderSizePixel = 0
+        cover.BackgroundColor3 = Color3.fromRGB(25, 25, 25)
+        cover.Position = UDim2.new(0, 0, 1, 0)
+        cover.Size = UDim2.new(1, 0, 0, 1)
+        cover.Parent = inline
+        tab.instances.cover = cover
+
+        local button = Instance.new("TextButton")
+        button.BackgroundTransparency = 1
+        button.Font = Enum.Font.Arial
+        button.TextSize = 12
+        button.TextColor3 = Color3.fromRGB(255, 255, 255)
+        button.Size = UDim2.new(1, 0, 1, 0)
+        button.TextStrokeTransparency = 0
+        button.Parent = inline
+        tab.instances.button = button
+
+        local canvas = Instance.new("Frame")
+        canvas.Size = UDim2.new(1, 0, 1, 0)
+        canvas.BackgroundTransparency = 1
+        canvas.Visible = false
+        canvas.Parent = self.instances.canvas
+        tab.instances.canvas = canvas
+        tab.instances.container = canvas
+
+        outline.Parent = self.instances.layout
+    end
+    function UITabList:_resize()
+        local layout = self.instances.layout
+        local cnt = #self.children
+        if cnt == 0 then return end
+        local totalSize = layout.AbsoluteSize.X - (cnt - 1) * 4
+        local size = totalSize / cnt
+        for _, tab in self.children do
+            tab.instances.outline.Size = UDim2.new(0, size, 1, 0)
+        end
+        local last = self.children[#self.children]
+        local outline = last.instances.outline
+        local curr = outline.AbsolutePosition.X + outline.AbsoluteSize.X
+        local expected = layout.AbsolutePosition.X + layout.AbsoluteSize.X
+        local diff = expected - curr
+        if diff ~= 0 then
+            outline.Size += UDim2.new(0, diff, 0, 0)
+        end
+    end
+    function UITabList:_makeInstances()
+        local container = Instance.new("Frame")
+        container.BackgroundColor3 = Color3.fromRGB(50, 50, 50)
+        container.BorderColor3 = Color3.fromRGB(0, 0, 0)
+        container.BorderSizePixel = 1
+        container.Position = UDim2.new(0, 5, 0, 26)
+        container.Size = UDim2.new(1, -10, 1, -31)
+        self.instances.container = container
+
+        local canvas = Instance.new("Frame")
+        canvas.BackgroundColor3 = Color3.fromRGB(30, 30, 30)
+        canvas.BorderSizePixel = 0
+        canvas.Position = UDim2.new(0, 1, 0, 1)
+        canvas.Size = UDim2.new(1, -2, 1, -2)
+        canvas.Parent = container
+        self.instances.canvas = canvas
+
+        local layout = Instance.new("Frame")
+        layout.BackgroundTransparency = 1
+        layout.Position = UDim2.new(0, -1, 0, -21)
+        layout.Size = UDim2.new(1, 2, 0, 21)
+        layout.Parent = container
+        self.instances.layout = layout
+
+        local listLayout = Instance.new("UIListLayout")
+        listLayout.Padding = UDim.new(0, 4)
+        listLayout.FillDirection = Enum.FillDirection.Horizontal
+        listLayout.SortOrder = Enum.SortOrder.LayoutOrder
+        listLayout.Parent = layout
+
+        container.Parent = self.parent.instances.canvas
+    end
+
+    -- ============================================================
+    -- UIBase
+    -- ============================================================
+    local UIBase = {}
+    UIBase.__index = UIBase
+    function UIBase.new()
+        local self = setmetatable({}, UIBase)
+        self._trove = Trove.new()
+        self.refs = {}
+        self.instances = {}
+        self.features = {}
+        self.visible = true
+        self.dragging = false
+        self.keybind = Enum.KeyCode.RightShift
+        self.activeMenu = "none"
+        self.visibilityChanged = self._trove:Add(Signal.new())
+        self:_makeInstances()
+        self:_bindDrag()
+        self.menus = {
+            dropdown = UIDropdownMenu.new(self),
+            colorpicker = UIColorpickerMenu.new(self),
+        }
+        self._trove:Add(self.menus.dropdown)
+        self._trove:Add(self.menus.colorpicker)
+        self._trove:Connect(self.instances.open.InputBegan, function(input)
+            if input.UserInputType == Enum.UserInputType.MouseButton1
+                or input.UserInputType == Enum.UserInputType.Touch then
+                self:setVisible(not self.visible)
+            end
+        end)
+        return self
+    end
+    function UIBase:setLabel(label)
+        assert(typeof(label) == "string", "UIBase:setLabel -> expected string")
+        self.instances.label.Text = label
+        return self
+    end
+    function UIBase:setKeybind(keybind)
+        assert(typeof(keybind) == "EnumItem", "UIBase:setKeybind -> expected Enum.KeyCode")
+        self.keybind = keybind
+        return self
+    end
+    function UIBase:setVisible(state)
+        assert(typeof(state) == "boolean", "UIBase:setVisible -> expected boolean")
+        if self.visible == state then return end
+        self.visible = state
+        self.instances.container.Visible = state
+        self.visibilityChanged:Fire(state)
+    end
+    function UIBase:makeDraggable(guiObject, trove, callback)
+        local dragInput, dragging = nil, false
+        local onMove = function(input)
+            if dragging and input == dragInput then callback(input) end
+        end
+        local conn = self._trove:Connect(UserInputService.InputChanged, onMove)
+        trove:Connect(self.visibilityChanged, function(state)
+            if not state then
+                dragging = false
+                trove:Remove(conn)
+                return
+            end
+            conn = trove:Connect(UserInputService.InputChanged, onMove)
+        end)
+        trove:Connect(guiObject.InputBegan, function(input)
+            if input.UserInputType == Enum.UserInputType.MouseButton1
+                or input.UserInputType == Enum.UserInputType.Touch then
+                dragging = true
+                dragInput = input
+                onMove(input)
+                local onChanged
+                onChanged = self._trove:Connect(input.Changed, function()
+                    if input.UserInputState == Enum.UserInputState.End then
+                        dragging = false
+                        trove:Remove(onChanged)
+                        dragInput = nil
+                    end
+                end)
+            end
+        end)
+        trove:Connect(guiObject.InputChanged, function(input)
+            if input.UserInputType == Enum.UserInputType.MouseMovement
+                or input.UserInputType == Enum.UserInputType.Touch then
+                dragInput = input
+            end
+        end)
+    end
+    function UIBase:_bindDrag()
+        local dragInput, dragStart, guiStart
+        self._trove:Connect(self.instances.drag.InputBegan, function(input)
+            if input.UserInputType == Enum.UserInputType.MouseButton1
+                or input.UserInputType == Enum.UserInputType.Touch then
+                self.dragging = true
+                dragStart = input.Position
+                guiStart = self.instances.container.Position
+                dragInput = input
+                local onChanged
+                onChanged = self._trove:Connect(input.Changed, function()
+                    if input.UserInputState == Enum.UserInputState.End then
+                        self.dragging = false
+                        self._trove:Remove(onChanged)
+                        dragInput = nil
+                    end
+                end)
+            end
+        end)
+        self._trove:Connect(UserInputService.InputChanged, function(input)
+            if self.dragging and input == dragInput then
+                local delta = input.Position - dragStart
+                self.instances.container.Position = UDim2.new(
+                    guiStart.X.Scale, guiStart.X.Offset + delta.X,
+                    guiStart.Y.Scale, guiStart.Y.Offset + delta.Y
+                )
+            end
+        end)
+        self._trove:Connect(self.instances.drag.InputChanged, function(input)
+            if input.UserInputType == Enum.UserInputType.MouseMovement
+                or input.UserInputType == Enum.UserInputType.Touch then
+                dragInput = input
+            end
+        end)
+    end
+    function UIBase:_makeInstances()
+        local screenGui = Instance.new("ScreenGui")
+        screenGui.ResetOnSpawn = false
+        screenGui.IgnoreGuiInset = true
+        screenGui.ScreenInsets = Enum.ScreenInsets.None
+        screenGui.DisplayOrder = 100
+        self.instances.gui = screenGui
+
+        local container = Instance.new("Frame")
+        container.BackgroundColor3 = Color3.fromRGB(55, 175, 225)
+        container.BorderSizePixel = 1
+        container.BorderColor3 = Color3.fromRGB(0, 0, 0)
+        container.AnchorPoint = Vector2.new(0.5, 0.5)
+        container.Position = UDim2.new(0.5, 0, 0.5, 0)
+        container.Size = UDim2.new(0, 500, 0, 400)
+        container.Parent = screenGui
+        self.instances.container = container
+
+        local background = Instance.new("Frame")
+        background.BackgroundColor3 = Color3.fromRGB(30, 30, 30)
+        background.Position = UDim2.new(0, 1, 0, 1)
+        background.Size = UDim2.new(1, -2, 1, -2)
+        background.BorderSizePixel = 0
+        background.Parent = container
+
+        local outer = Instance.new("Frame")
+        outer.BackgroundColor3 = Color3.fromRGB(0, 0, 0)
+        outer.Position = UDim2.new(0, 5, 0, 19)
+        outer.Size = UDim2.new(1, -10, 1, -24)
+        outer.BorderColor3 = Color3.fromRGB(50, 50, 50)
+        outer.Parent = background
+
+        local canvas = Instance.new("Frame")
+        canvas.BackgroundColor3 = Color3.fromRGB(25, 25, 25)
+        canvas.Position = UDim2.new(0, 1, 0, 1)
+        canvas.Size = UDim2.new(1, -2, 1, -2)
+        canvas.BorderSizePixel = 0
+        canvas.Parent = outer
+        self.instances.canvas = canvas
+
+        local title = Instance.new("TextLabel")
+        title.Size = UDim2.new(1, -8, 0, 11)
+        title.Position = UDim2.new(0, 4, 0, 4)
+        title.Font = Enum.Font.Arial
+        title.TextSize = 12
+        title.TextStrokeTransparency = 0
+        title.BackgroundTransparency = 1
+        title.TextXAlignment = Enum.TextXAlignment.Left
+        title.TextColor3 = Color3.fromRGB(255, 255, 255)
+        title.Parent = background
+        self.instances.label = title
+
+        local drag = Instance.new("TextButton")
+        drag.BackgroundTransparency = 1
+        drag.Text = ""
+        drag.Size = UDim2.new(1, 0, 0, 20)
+        drag.Modal = true
+        drag.Parent = container
+        self.instances.drag = drag
+
+        local open = Instance.new("TextButton")
+        open.BackgroundColor3 = Color3.fromRGB(25, 25, 25)
+        open.AutoButtonColor = false
+        open.Position = UDim2.new(0.5, 0, 0, 0)
+        open.Size = UDim2.new(0, 50, 0, 50)
+        open.Font = Enum.Font.Arimo
+        open.TextSize = 12
+        open.TextColor3 = Color3.fromRGB(255, 255, 255)
+        open.Text = "Open"
+        open.BackgroundTransparency = 0.5
+        open.AnchorPoint = Vector2.new(0.5, 0)
+        open.Visible = false
+        open.Parent = screenGui
+        self.instances.open = open
+
+        local uiCorner = Instance.new("UICorner")
+        uiCorner.CornerRadius = UDim.new(0, 5)
+        uiCorner.Parent = open
+    end
+    function UIBase:newTabList()
+        assert(self.child == nil, "UIBase:newTabList -> child already exists")
+        local tabList = UITabList.new(self)
+        self.child = tabList
+        return tabList
+    end
+    function UIBase:encodeJSON()
+        local config = {}
+        for flag, feature in pairs(self.features) do
+            if typeof(feature.value) == "table" then
+                local clone = table.clone(feature.value)
+                for k, v in pairs(clone) do
+                    if typeof(v) == "Color3" then
+                        clone[k] = { v.R, v.G, v.B }
+                    elseif typeof(v) == "EnumItem" then
+                        clone[k] = { "Enum", v.EnumType and tostring(v.EnumType) or "Unknown", v.Name or "None" }
+                    end
+                end
+                config[flag] = clone
+            else
+                config[flag] = feature.value
+            end
+        end
+        return HttpService:JSONEncode(config)
+    end
+    function UIBase:decodeJSON(json)
+        local decoded
+        local ok = pcall(function() decoded = HttpService:JSONDecode(json) end)
+        if not ok or type(decoded) ~= "table" then return false, "invalid json" end
+        for flag, value in pairs(decoded) do
+            local feature = self.features[flag]
+            if feature then
+                pcall(function()
+                    if type(value) == "table" then
+                        if value.rgb and value.alpha then
+                            feature:set({ rgb = Color3.new(value.rgb[1], value.rgb[2], value.rgb[3]), alpha = value.alpha })
+                        elseif value.key and value.mode then
+                            feature:set({ key = Enum[value.key[2]][value.key[3]], mode = value.mode })
+                        else
+                            feature:set(value)
+                        end
+                    else
+                        feature:set(value)
+                    end
+                end)
+            end
+        end
+        return true
+    end
+    function UIBase:Finish()
+        if setidentity then setidentity(8) end
+        self.instances.gui.Parent = CoreGui
+    end
+    function UIBase:Destroy()
+        self._trove:Clean()
+    end
+
+    -- ============================================================
+    -- Section factory
+    -- ============================================================
+    function UISection:newToggle(flag)                return UIToggle.new(self, flag) end
+    function UISection:newSlider(flag, min, max, dec) return UISlider.new(self, flag, min, max, dec) end
+    function UISection:newDropdown(flag, multi, opts) return UIDropdown.new(self, flag, multi, opts) end
+    function UISection:newTextBox(flag)               return UITextBox.new(self, flag) end
+    function UISection:newLabel(flag)                 return UILabel.new(self, flag) end
+    function UISection:newButton(flag)                return UIButton.new(self, flag) end
+
+    -- ============================================================
+    -- Public API — what loadstring returns
+    -- ============================================================
+    LIB.Trove  = Trove
+    LIB.Signal = Signal
+    LIB.new    = UIBase.new
+end
+
+return LIB
