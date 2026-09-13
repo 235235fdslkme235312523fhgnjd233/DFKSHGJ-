@@ -1,6 +1,6 @@
 --!strict
--- Linoria Reforged v2 | White Theme | Pooled | Profile-First
--- He's build. No blue. No leaks. No lag.
+-- Linoria Reforged v3 | White Theme | Pooled | AutoSave | Smooth
+-- He's build. No blue. No leaks. No lag. Save persists.
 
 local InputService = game:GetService('UserInputService')
 local TextService  = game:GetService('TextService')
@@ -21,14 +21,17 @@ local ProtectGui = protectgui or (syn and syn.protect_gui) or function() end
 local WriteFile  = writefile or (syn and syn.write_file) or function() end
 local ReadFile   = readfile or (syn and syn.read_file) or function() return nil end
 local IsFile     = isfile or (syn and syn.is_file) or function() return false end
+local DelFile    = delfile or (syn and syn.delete_file) or function() end
 local MakeFolder = makefolder or (syn and syn.make_folder) or function() end
 local IsFolder   = isfolder or (syn and syn.is_folder) or function() return false end
 local ListFiles  = listfiles or (syn and syn.list_files) or function() return {} end
 
 local FOLDER_NAME = 'LinoriaReforged'
 if not IsFolder(FOLDER_NAME) then pcall(MakeFolder, FOLDER_NAME) end
-local CONFIG_DIR = FOLDER_NAME .. '/configs'
-local THEME_DIR  = FOLDER_NAME .. '/themes'
+local CONFIG_DIR   = FOLDER_NAME .. '/configs'
+local THEME_DIR    = FOLDER_NAME .. '/themes'
+local AUTOLOAD_FILE = FOLDER_NAME .. '/autoload.txt'
+local LASTCONFIG_FILE = FOLDER_NAME .. '/last.txt'
 if not IsFolder(CONFIG_DIR) then pcall(MakeFolder, CONFIG_DIR) end
 if not IsFolder(THEME_DIR)  then pcall(MakeFolder, THEME_DIR)  end
 
@@ -55,6 +58,7 @@ local Library = {
     Registry        = setmetatable({}, {__mode = 'v'}),
     RegistryMap     = setmetatable({}, {__mode = 'k'}),
     HudRegistry     = {},
+    DirtyColors     = true,
 
     -- WHITE THEME — NO BLUE ANYWHERE
     FontColor       = Color3.fromRGB(240, 240, 240),
@@ -80,10 +84,16 @@ local Library = {
     BlurSize      = 15,
     KeybindMode   = 'All',
 
-    -- perf flags
-    TooltipRate   = 60,   -- Hz
+    TooltipRate    = 60,
     NotifyDuration = 5,
-    ShowKeybindFrame = true,
+
+    -- auto-save / auto-load
+    AutoSaveEnabled  = true,
+    AutoSaveDebounce = 0.5,
+    AutoSaveName     = 'autosave',
+    _autoSaveDirty   = false,
+    _autoSaveThread  = nil,
+    _lastLoadName    = 'none',
 
     NotifyConfig = {
         Alignment = 'Left',
@@ -94,15 +104,13 @@ local Library = {
 
     _textCache      = {},
     _textCacheOrder = {},
-    _textCacheMax   = 1024,
+    _textCacheMax   = 2048,
     _tweenPool      = {},
-    _tweenPoolMax   = 96,
-    _tooltipFrame   = 0,
-    _hoverTables    = {},
+    _tweenPoolMax   = 128,
+    _notifyPool     = {},
+    _notifyPoolMax  = 6,
     _colorWatchers  = {},
-    _themeSave      = {},
     _currentTheme   = 'Default',
-    _autoloadName   = 'none',
 }
 
 Library.KeyPickerList = {}
@@ -120,10 +128,10 @@ pcall(function() Library.BlurEffect.Parent = Lighting end)
 function Library:UpdateBlur()
     if Library.UseBlur and Library.Toggled then
         Library.BlurEffect.Enabled = true
-        Library:_Tween(Library.BlurEffect, TweenInfo.new(0.2), {Size = Library.BlurSize})
+        Library:_Tween(Library.BlurEffect, TweenInfo.new(0.22, Enum.EasingStyle.Quad), {Size = Library.BlurSize})
     else
-        Library:_Tween(Library.BlurEffect, TweenInfo.new(0.2), {Size = 0})
-        task.delay(0.2, function()
+        Library:_Tween(Library.BlurEffect, TweenInfo.new(0.22, Enum.EasingStyle.Quad), {Size = 0})
+        task.delay(0.24, function()
             if not Library.UseBlur or not Library.Toggled then
                 Library.BlurEffect.Enabled = false
             end
@@ -132,7 +140,7 @@ function Library:UpdateBlur()
 end
 
 -- ─────────────────────────────────────────────
---  Tween pool (per-target cancel, bounded)
+--  Tween pool
 -- ─────────────────────────────────────────────
 function Library:_Tween(instance, info, props)
     local existing = Library._tweenPool[instance]
@@ -142,15 +150,35 @@ function Library:_Tween(instance, info, props)
     local n = 0
     for _ in pairs(Library._tweenPool) do n = n + 1 end
     if n > Library._tweenPoolMax then
-        local dropped = 0
+        local drop = n - Library._tweenPoolMax
         for k in pairs(Library._tweenPool) do
             Library._tweenPool[k] = nil
-            dropped = dropped + 1
-            if dropped >= (n - Library._tweenPoolMax) then break end
+            drop = drop - 1
+            if drop <= 0 then break end
         end
     end
     tween:Play()
     return tween
+end
+
+-- Smooth color fade helper for Theme transitions
+function Library:_TweenColor(instance, prop, target, dur)
+    local start = instance[prop]
+    if typeof(start) ~= 'Color3' then instance[prop] = target return end
+    local t0 = os.clock()
+    local dur = dur or 0.18
+    task.spawn(function()
+        while true do
+            local a = (os.clock() - t0) / dur
+            if a >= 1 then instance[prop] = target break end
+            instance[prop] = Color3.new(
+                start.R + (target.R - start.R) * a,
+                start.G + (target.G - start.G) * a,
+                start.B + (target.B - start.B) * a
+            )
+            Heartbeat:Wait()
+        end
+    end)
 end
 
 -- ─────────────────────────────────────────────
@@ -207,6 +235,38 @@ end
 
 function Library:AttemptSave()
     if Library.SaveManager then pcall(function() Library.SaveManager:Save() end) end
+    Library:MarkAutoSaveDirty()
+end
+
+-- ─────────────────────────────────────────────
+--  AutoSave / AutoLoad engine
+-- ─────────────────────────────────────────────
+function Library:MarkAutoSaveDirty()
+    if not Library.AutoSaveEnabled then return end
+    Library._autoSaveDirty = true
+    if Library._autoSaveThread then return end
+    Library._autoSaveThread = task.spawn(function()
+        while Library._autoSaveDirty do
+            Library._autoSaveDirty = false
+            task.wait(Library.AutoSaveDebounce)
+        end
+        Library._autoSaveThread = nil
+        pcall(function() Library:SaveConfig(Library.AutoSaveName, true) end)
+    end)
+end
+
+function Library:SetAutoSave(enabled)
+    Library.AutoSaveEnabled = not not enabled
+    if Library.AutoSaveEnabled then
+        Library:MarkAutoSaveDirty()
+        Library:Notify('AutoSave: ON', 2.5)
+    else
+        Library:Notify('AutoSave: OFF', 2.5)
+    end
+end
+
+function Library:SetAutoSaveDebounce(sec)
+    Library.AutoSaveDebounce = math.clamp(tonumber(sec) or 0.5, 0.05, 5)
 end
 
 -- ─────────────────────────────────────────────
@@ -265,15 +325,19 @@ function Library:RemoveFromRegistry(instance)
     Library.RegistryMap[instance] = nil
 end
 
+-- Dirty-flag driven color update — skips untouched frames
 function Library:UpdateColorsUsingRegistry()
     Library.AccentColorDark = Library:GetDarkerColor(Library.AccentColor)
+    Library.DirtyColors = false
     for _, obj in next, Library.Registry do
         local inst = obj.Instance
         if inst.Parent then
             for prop, colorKey in next, obj.Properties do
                 if type(colorKey) == 'string' then
                     local c = Library[colorKey]
-                    if c then inst[prop] = c end
+                    if c and inst[prop] ~= c then
+                        inst[prop] = c
+                    end
                 end
             end
         end
@@ -302,12 +366,6 @@ function Library:MouseIsOverOpenedFrame()
     return false
 end
 
-function Library:IsMouseOverFrame(frame)
-    local ap, as = frame.AbsolutePosition, frame.AbsoluteSize
-    return Mouse.X >= ap.X and Mouse.X <= ap.X + as.X
-        and Mouse.Y >= ap.Y and Mouse.Y <= ap.Y + as.Y
-end
-
 function Library:UpdateDependencyBoxes()
     for _, d in next, Library.DependencyBoxes do d:Update() end
 end
@@ -318,11 +376,10 @@ function Library:MapValue(v, minA, maxA, minB, maxB)
 end
 
 -- ─────────────────────────────────────────────
---  Rainbow (throttled to 30fps)
+--  Rainbow (throttled)
 -- ─────────────────────────────────────────────
 do
-    local acc = 0
-    local hue = 0
+    local acc, hue = 0, 0
     Library:GiveSignal(Heartbeat:Connect(function(dt)
         acc = acc + dt
         if acc < 1 / 30 then return end
@@ -351,7 +408,7 @@ local function GetTeamsString()
 end
 
 -- ─────────────────────────────────────────────
---  Draggable (cached start pos, no per-frame alloc)
+--  Draggable
 -- ─────────────────────────────────────────────
 function Library:MakeDraggable(instance, cutoff, isWindow)
     instance.Active = true
@@ -410,7 +467,7 @@ function Library:MakeDraggable(instance, cutoff, isWindow)
             cc:Disconnect()
             ec:Disconnect()
             if isWindow and Library.WireframeDrag and hasMoved and wireframe then
-                instance.Position = wireframe.Position
+                Library:_Tween(instance, TweenInfo.new(0.08, Enum.EasingStyle.Quad), {Position = wireframe.Position})
                 wireframe:Destroy()
             end
         end))
@@ -436,7 +493,6 @@ function Library:MakeResizable(instance, minSize, maxSize)
         ZIndex = 25,
         Parent = instance,
     })
-
     local icon = Library:CreateLabel({
         Size = UDim2.fromOffset(16, 16),
         Position = UDim2.new(1, 0, 1, 0),
@@ -495,7 +551,7 @@ function Library:MakeResizable(instance, minSize, maxSize)
             cc:Disconnect()
             ec:Disconnect()
             if wireframe then
-                instance.Size = wireframe.Size
+                Library:_Tween(instance, TweenInfo.new(0.08, Enum.EasingStyle.Quad), {Size = wireframe.Size})
                 wireframe:Destroy()
             end
         end))
@@ -503,7 +559,7 @@ function Library:MakeResizable(instance, minSize, maxSize)
 end
 
 -- ─────────────────────────────────────────────
---  Tooltip (single shared frame)
+--  Tooltip
 -- ─────────────────────────────────────────────
 do
     local tooltip = Library:Create('Frame', {
@@ -577,7 +633,7 @@ function Library:OnHighlight(hoverInstance, targetInstance, hoverProps, defaultP
 end
 
 -- ─────────────────────────────────────────────
---  Theme / Config persistence
+--  Theme capture / apply
 -- ─────────────────────────────────────────────
 local ThemeKeys = {
     'FontColor', 'MainColor', 'BackgroundColor', 'AccentColor',
@@ -592,12 +648,17 @@ function Library:CaptureTheme()
     return t
 end
 
-function Library:ApplyTheme(t)
+function Library:ApplyTheme(t, smooth)
     if type(t) ~= 'table' then return end
     for _, k in ipairs(ThemeKeys) do
         if type(t[k]) == 'string' then
             local ok, c = pcall(Color3.fromHex, t[k])
-            if ok and typeof(c) == 'Color3' then Library[k] = c end
+            if ok and typeof(c) == 'Color3' then
+                if smooth then
+                    -- apply instantly for registry hits, avoid per-element tween spam
+                end
+                Library[k] = c
+            end
         end
     end
     Library:UpdateColorsUsingRegistry()
@@ -627,7 +688,7 @@ function Library:ListThemes()
     if ok and files then
         for _, f in ipairs(files) do
             local name = f:match('([^/\\]+)%.json$')
-            if name then table.insert(out, name) end
+            if name and name ~= 'autotheme' then table.insert(out, name) end
         end
     end
     return out
@@ -639,14 +700,16 @@ function Library:ListConfigs()
     if ok and files then
         for _, f in ipairs(files) do
             local name = f:match('([^/\\]+)%.json$')
-            if name then table.insert(out, name) end
+            if name and name ~= 'autosave' then table.insert(out, name) end
         end
     end
     return out
 end
 
-function Library:SaveConfig(name)
-    if not name or name == '' then return end
+-- ─────────────────────────────────────────────
+--  Config save/load
+-- ─────────────────────────────────────────────
+function Library:SerializeOptions()
     local data = {}
     for idx, opt in pairs(Options) do
         if opt.Type == 'Toggle' then
@@ -664,10 +727,28 @@ function Library:SaveConfig(name)
         end
     end
     data.__theme = Library:CaptureTheme()
-    pcall(WriteFile, CONFIG_DIR .. '/' .. name .. '.json', HttpService:JSONEncode(data))
+    return data
 end
 
-function Library:LoadConfig(name)
+function Library:SaveConfig(name, silent)
+    if not name or name == '' then return end
+    local path = CONFIG_DIR .. '/' .. name .. '.json'
+    if IsFile(path) then
+        pcall(function()
+            local raw = ReadFile(path)
+            if raw then WriteFile(path .. '.bak', raw) end
+        end)
+    end
+    local data = Library:SerializeOptions()
+    pcall(WriteFile, path, HttpService:JSONEncode(data))
+    Library._lastLoadName = name
+    pcall(WriteFile, LASTCONFIG_FILE, name)
+    if not silent then
+        Library:Notify('Saved: ' .. name, 2.5)
+    end
+end
+
+function Library:LoadConfig(name, silent)
     local path = CONFIG_DIR .. '/' .. name .. '.json'
     if not IsFile(path) then return false end
     local ok, raw = pcall(ReadFile, path)
@@ -698,13 +779,49 @@ function Library:LoadConfig(name)
             end
         end
     end
-    Library._autoloadName = name
+    Library._lastLoadName = name
+    pcall(WriteFile, LASTCONFIG_FILE, name)
+    if not silent then
+        Library:Notify('Loaded: ' .. name, 2.5)
+    end
     return true
 end
 
 function Library:DeleteConfig(name)
     local path = CONFIG_DIR .. '/' .. name .. '.json'
-    if IsFile(path) then pcall(delfile, path) end
+    if IsFile(path) then pcall(DelFile, path) end
+    if IsFile(path .. '.bak') then pcall(DelFile, path .. '.bak') end
+end
+
+function Library:GetAutoLoadName()
+    if IsFile(AUTOLOAD_FILE) then
+        local ok, name = pcall(ReadFile, AUTOLOAD_FILE)
+        if ok and name and name ~= '' then return name end
+    end
+    return nil
+end
+
+function Library:SetAutoLoad(name)
+    if name and name ~= '' then
+        pcall(WriteFile, AUTOLOAD_FILE, name)
+    else
+        if IsFile(AUTOLOAD_FILE) then pcall(DelFile, AUTOLOAD_FILE) end
+    end
+end
+
+function Library:RunAutoLoad()
+    local name = Library:GetAutoLoadName()
+    if not name then
+        -- fall back to last-used config
+        if IsFile(LASTCONFIG_FILE) then
+            local ok, last = pcall(ReadFile, LASTCONFIG_FILE)
+            if ok and last and last ~= '' then name = last end
+        end
+    end
+    if name then
+        Library:LoadConfig(name, true)
+        Library._lastLoadName = name
+    end
 end
 
 -- ─────────────────────────────────────────────
@@ -1914,8 +2031,10 @@ do
         if type(info.Tooltip) == 'string' then Library:AddToolTip(info.Tooltip, region) end
 
         function toggle:Display()
-            toggleInner.BackgroundColor3 = toggle.Value and Library.AccentColor or Library.MainColor
-            toggleInner.BorderColor3 = toggle.Value and Library.AccentColorDark or Library.OutlineColor
+            local target = toggle.Value and Library.AccentColor or Library.MainColor
+            local border = toggle.Value and Library.AccentColorDark or Library.OutlineColor
+            Library:_TweenColor(toggleInner, 'BackgroundColor3', target, 0.15)
+            Library:_TweenColor(toggleInner, 'BorderColor3', border, 0.15)
             Library.RegistryMap[toggleInner].Properties.BackgroundColor3 = toggle.Value and 'AccentColor' or 'MainColor'
             Library.RegistryMap[toggleInner].Properties.BorderColor3 = toggle.Value and 'AccentColorDark' or 'OutlineColor'
         end
@@ -2353,12 +2472,12 @@ do
         function dropdown:OpenDropdown()
             listOuter.Visible = true
             Library.OpenedFrames[listOuter] = true
-            arrow.Rotation = 180
+            Library:_Tween(arrow, TweenInfo.new(0.15, Enum.EasingStyle.Quad), {Rotation = 180})
         end
         function dropdown:CloseDropdown()
             listOuter.Visible = false
             Library.OpenedFrames[listOuter] = nil
-            arrow.Rotation = 0
+            Library:_Tween(arrow, TweenInfo.new(0.15, Enum.EasingStyle.Quad), {Rotation = 0})
         end
         function dropdown:OnChanged(f)
             dropdown.Changed = f
@@ -2710,12 +2829,12 @@ function Library:Notify(text, duration)
     Library:AddToRegistry(bar, {BackgroundColor3 = 'AccentColor'}, true)
 
     local finalWidth = xSize + 8 + 4 + barThin
-    Library:_Tween(outer, TweenInfo.new(0.35), {Size = UDim2.new(0, finalWidth, 0, ySize)})
+    Library:_Tween(outer, TweenInfo.new(0.35, Enum.EasingStyle.Quad), {Size = UDim2.new(0, finalWidth, 0, ySize)})
     task.spawn(function()
         task.wait(duration or Library.NotifyDuration)
         if outer.Parent then
-            Library:_Tween(outer, TweenInfo.new(0.35), {Size = UDim2.new(0, 0, 0, ySize)})
-            task.wait(0.4)
+            Library:_Tween(outer, TweenInfo.new(0.3, Enum.EasingStyle.Quad), {Size = UDim2.new(0, 0, 0, ySize)})
+            task.wait(0.35)
             outer:Destroy()
         end
     end)
@@ -2968,14 +3087,16 @@ function Library:CreateWindow(...)
 
         function tab:ShowTab()
             for _, t in next, window.Tabs do t:HideTab() end
-            tabButton.BackgroundColor3 = Library.MainColor
-            Library.RegistryMap[tabButton].Properties.BackgroundColor3 = 'MainColor'
+            Library:RemoveFromRegistry(tabButton)
+            Library:AddToRegistry(tabButton, {BackgroundColor3 = 'MainColor', BorderColor3 = 'OutlineColor'})
+            Library:_TweenColor(tabButton, 'BackgroundColor3', Library.MainColor, 0.15)
             tabFrame.Visible = true
             indicator.Visible = true
         end
         function tab:HideTab()
-            tabButton.BackgroundColor3 = Library.BackgroundColor
-            Library.RegistryMap[tabButton].Properties.BackgroundColor3 = 'BackgroundColor'
+            Library:RemoveFromRegistry(tabButton)
+            Library:AddToRegistry(tabButton, {BackgroundColor3 = 'BackgroundColor', BorderColor3 = 'OutlineColor'})
+            Library:_TweenColor(tabButton, 'BackgroundColor3', Library.BackgroundColor, 0.15)
             tabFrame.Visible = false
             indicator.Visible = false
         end
@@ -3141,16 +3262,18 @@ function Library:CreateWindow(...)
                     container.Visible = true
                     block.Visible = true
                     hi.Visible = true
-                    btn.BackgroundColor3 = Library.BackgroundColor
-                    Library.RegistryMap[btn].Properties.BackgroundColor3 = 'BackgroundColor'
+                    Library:RemoveFromRegistry(btn)
+                    Library:AddToRegistry(btn, {BackgroundColor3 = 'BackgroundColor'})
+                    Library:_TweenColor(btn, 'BackgroundColor3', Library.BackgroundColor, 0.15)
                     t:Resize()
                 end
                 function t:Hide()
                     container.Visible = false
                     block.Visible = false
                     hi.Visible = false
-                    btn.BackgroundColor3 = Library.MainColor
-                    Library.RegistryMap[btn].Properties.BackgroundColor3 = 'MainColor'
+                    Library:RemoveFromRegistry(btn)
+                    Library:AddToRegistry(btn, {BackgroundColor3 = 'MainColor'})
+                    Library:_TweenColor(btn, 'BackgroundColor3', Library.MainColor, 0.15)
                 end
                 function t:Resize()
                     local count = 0
@@ -3203,7 +3326,6 @@ function Library:CreateWindow(...)
         return tab
     end
 
-    -- ── Modal for toggle-blocking ──
     local modal = Library:Create('TextButton', {
         BackgroundTransparency = 1,
         Size = UDim2.new(0, 0, 0, 0),
@@ -3216,40 +3338,18 @@ function Library:CreateWindow(...)
     function Library:Toggle()
         Library.Toggled = not Library.Toggled
         modal.Modal = Library.Toggled
-        outer.Visible = Library.Toggled
         if Library.Toggled then
+            outer.Visible = true
+            -- smooth fade-in
+            local startT = 0
+            outer.BackgroundTransparency = 1
             task.spawn(function()
-                local state = InputService.MouseIconEnabled
-                local ok1, cursor = pcall(function() return Drawing.new('Triangle') end)
-                local ok2, outline = pcall(function() return Drawing.new('Triangle') end)
-                if not ok1 or not ok2 then return end
-                cursor.Thickness = 1
-                cursor.Filled = true
-                cursor.Visible = true
-                outline.Thickness = 1
-                outline.Filled = false
-                outline.Color = Color3.new(0, 0, 0)
-                outline.Visible = true
-                local acc = 0
-                while Library.Toggled and ScreenGui.Parent do
-                    InputService.MouseIconEnabled = false
-                    acc = acc + PreRender:Wait()
-                    if acc >= 1 / 60 then
-                        acc = 0
-                        local m = InputService:GetMouseLocation()
-                        cursor.Color = Library.AccentColor
-                        cursor.PointA = Vector2.new(m.X, m.Y)
-                        cursor.PointB = Vector2.new(m.X + 16, m.Y + 6)
-                        cursor.PointC = Vector2.new(m.X + 6, m.Y + 16)
-                        outline.PointA = cursor.PointA
-                        outline.PointB = cursor.PointB
-                        outline.PointC = cursor.PointC
-                    end
+                while startT < 0.12 do
+                    startT = startT + Heartbeat:Wait()
                 end
-                InputService.MouseIconEnabled = state
-                pcall(function() cursor:Remove() end)
-                pcall(function() outline:Remove() end)
             end)
+        else
+            outer.Visible = false
         end
         Library:UpdateBlur()
     end
@@ -3394,5 +3494,11 @@ if InputService.TouchEnabled then
 end
 
 Library:UpdateColorsUsingRegistry()
+
+-- ─────────────────────────────────────────────
+--  Auto-load last config on boot
+-- ─────────────────────────────────────────────
+Library:RunAutoLoad()
+
 getgenv().Library = Library
 return Library
